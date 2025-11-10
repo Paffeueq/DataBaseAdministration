@@ -59,7 +59,7 @@ a calkowita dlugosc klucza nie moze byc wieksza niz 900 - zalezy od SQL
 stąd przyjmujemy max nazwy 100 znakow
 */
 
-use b25_adm
+use B25_ADM_PM331720
 go
 
 /* tabela nadrzedna - nagłowek zapisania kluczy dla danej bazy */
@@ -156,7 +156,7 @@ GO
 
 -- testowanie
 declare @s2_sql nvarchar(1000)
-set @s2_sql = N'USE PWX_DB;SELECT DISTINCT MIASTA.KOD_WOJ AS [KOD_WOJ w MIASTA nie ma w WOJ] FROM MIASTA WHERE NOT EXISTS (SELECT 1 FROM WOJ WHERE MIASTA.[KOD_WOJ]=WOJ.[KOD_WOJ])'
+set @s2_sql = N'USE B25_ADM_PM331720;SELECT DISTINCT MIASTA.KOD_WOJ AS [KOD_WOJ w MIASTA nie ma w WOJ] FROM MIASTA WHERE NOT EXISTS (SELECT 1 FROM WOJ WHERE MIASTA.[KOD_WOJ]=WOJ.[KOD_WOJ])'
 exec sp_executeSql @s2_sql
 /*
 declare @s2_sql nvarchar(1000), @wynik int

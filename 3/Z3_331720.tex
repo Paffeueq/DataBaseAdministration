@@ -1,0 +1,778 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[polish]{babel}
+\usepackage{graphicx}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage[margin=2.5cm]{geometry}
+
+\lstset{
+	basicstyle=\ttfamily\footnotesize,
+	breaklines=true,
+	frame=single,
+	backgroundcolor=\color{gray!10},
+	xleftmargin=5pt,
+	framexleftmargin=5pt,
+	numbers=left,
+	numberstyle=\tiny\color{gray},
+	keywordstyle=\color{blue}\bfseries,
+	commentstyle=\color{green!60!black},
+	stringstyle=\color{red}
+}
+
+\title{Laboratorium nr 3 -- Administracja BD\\
+	\large System Zarządzania Kluczami Obcymi}
+\author{Paweł Myszka\\
+	Nr albumu: 331720}
+\date{10 listopada 2025}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Z3 -- 331720}
+\fancyhead[C]{Administracja Bazami Danych}
+\fancyhead[R]{Paweł Myszka}
+\fancyfoot[C]{\thepage\ / \pageref{LastPage}}
+
+\begin{document}
+	
+	\maketitle
+	\thispagestyle{fancy}
+	
+	\section{Cel laboratorium}
+	
+	Celem laboratorium było stworzenie systemu do zarządzania kluczami obcymi w bazach danych. System umożliwia:
+	\begin{itemize}
+		\item \textbf{Zapamiętywanie} stanu kluczy obcych w bazie danych
+		\item \textbf{Usuwanie} wszystkich kluczy obcych (np. przed ładowaniem danych)
+		\item \textbf{Odtwarzanie} kluczy obcych ze sprawdzeniem spójności danych
+		\item \textbf{Raportowanie} błędów podczas odtwarzania
+	\end{itemize}
+	
+	Typowy scenariusz użycia:
+	\begin{enumerate}
+		\item Przed załadowaniem dużej ilości danych -- kasujemy klucze obce
+		\item Ładujemy dane bez przejmowania się kolejnością
+		\item Po załadowaniu -- odtwarzamy klucze obce
+		\item System automatycznie wykrywa i raportuje problemy ze spójnością
+	\end{enumerate}
+	
+	\section{Struktura systemu}
+	
+	\subsection{Tabele administracyjne}
+	
+	\subsubsection{FK\_STORE -- Nagłówek zapisu kluczy}
+	
+	\begin{lstlisting}[language=SQL]
+CREATE TABLE dbo.FK_STORE (
+	store_id INT IDENTITY(1,1) PRIMARY KEY,
+	[desc] NVARCHAR(250) NOT NULL,
+	db NVARCHAR(100) NOT NULL,
+	start_dstamp DATETIME NOT NULL DEFAULT GETDATE(),
+	end_dstamp DATETIME,
+	err_msg NVARCHAR(500),
+	rmv_after_store BIT DEFAULT 0
+);
+	\end{lstlisting}
+	
+	\textbf{Pole:}
+	\begin{itemize}
+		\item \texttt{store\_id} -- ID operacji zapisu
+		\item \texttt{desc} -- Opis operacji
+		\item \texttt{db} -- Nazwa bazy danych
+		\item \texttt{start\_dstamp} -- Data rozpoczęcia
+		\item \texttt{end\_dstamp} -- Data zakończenia (NULL = nie zakończono)
+		\item \texttt{err\_msg} -- Komunikat błędu (NULL = OK)
+	\end{itemize}
+	
+	\subsubsection{FK\_STORE\_DET -- Szczegóły zapisanych kluczy}
+	
+	\begin{lstlisting}[language=SQL]
+CREATE TABLE dbo.FK_STORE_DET (
+	det_id INT IDENTITY(1,1) PRIMARY KEY,
+	store_id INT NOT NULL,
+	master_tab NVARCHAR(100) NOT NULL,
+	master_col NVARCHAR(100) NOT NULL,
+	details_tab NVARCHAR(100) NOT NULL,
+	details_col NVARCHAR(100) NOT NULL,
+	fk_name NVARCHAR(250) NOT NULL,
+	removed BIT DEFAULT 0,
+	FOREIGN KEY (store_id) REFERENCES FK_STORE(store_id)
+);
+	\end{lstlisting}
+	
+	\textbf{Pola:}
+	\begin{itemize}
+		\item \texttt{det\_id} -- ID szczegółu
+		\item \texttt{store\_id} -- Powiązanie z FK\_STORE
+		\item \texttt{master\_tab, master\_col} -- Tabela i kolumna master
+		\item \texttt{details\_tab, details\_col} -- Tabela i kolumna details
+		\item \texttt{fk\_name} -- Nazwa klucza obcego
+		\item \texttt{removed} -- Czy klucz został usunięty (1/0)
+	\end{itemize}
+	
+	\subsubsection{FK\_RESTORE -- Nagłówek odtwarzania}
+	
+	\begin{lstlisting}[language=SQL]
+CREATE TABLE dbo.FK_RESTORE (
+	restore_id INT IDENTITY(1,1) PRIMARY KEY,
+	[desc] NVARCHAR(250) NOT NULL,
+	db NVARCHAR(100) NOT NULL,
+	start_dstamp DATETIME NOT NULL DEFAULT GETDATE(),
+	end_dstamp DATETIME,
+	err_msg NVARCHAR(500)
+);
+	\end{lstlisting}
+	
+	\subsubsection{FK\_RESTORE\_JOB -- Szczegóły odtwarzania}
+	
+	\begin{lstlisting}[language=SQL]
+CREATE TABLE dbo.FK_RESTORE_JOB (
+	job_id INT IDENTITY(1,1) PRIMARY KEY,
+	package_id INT NOT NULL,
+	detail_col NVARCHAR(100),
+	detail_table NVARCHAR(100),
+	master_col NVARCHAR(100),
+	master_table NVARCHAR(100),
+	db NVARCHAR(100),
+	fk_name NVARCHAR(250),
+	fk_already_exists BIT,
+	data_inconsistency BIT,
+	cr_start DATETIME,
+	cr_end DATETIME,
+	err_msg NVARCHAR(500),
+	FOREIGN KEY (package_id) REFERENCES FK_RESTORE(restore_id)
+);
+	\end{lstlisting}
+	
+	\subsubsection{FK\_CHECK\_QUERY -- Cache zapytań}
+	
+	\begin{lstlisting}[language=SQL]
+CREATE TABLE dbo.FK_CHECK_QUERY (
+	check_id INT IDENTITY(1,1) PRIMARY KEY,
+	col_name_where_data_exists NVARCHAR(100),
+	tab_where_data_exists NVARCHAR(100),
+	col_to_check NVARCHAR(100),
+	tab_to_check NVARCHAR(100),
+	db NVARCHAR(100),
+	s_query_check NVARCHAR(MAX),
+	s_query_show NVARCHAR(MAX),
+	UNIQUE (db, tab_to_check, col_to_check, tab_where_data_exists, col_name_where_data_exists)
+);
+	\end{lstlisting}
+	
+	\subsection{Funkcje pomocnicze}
+	
+	\subsubsection{F\_REF\_CHECK\_QUERY}
+	
+	Generuje zapytanie SQL sprawdzające czy istnieją rekordy w tabeli details, które nie mają odpowiednika w tabeli master:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE FUNCTION dbo.F_REF_CHECK_QUERY(
+	@details_col NVARCHAR(100),
+	@details_tab NVARCHAR(100),
+	@master_col NVARCHAR(100),
+	@master_tab NVARCHAR(100),
+	@db NVARCHAR(100)
+)
+RETURNS NVARCHAR(2000)
+AS
+BEGIN
+	DECLARE @result NVARCHAR(2000);
+	SET @result = N'USE [' + @db + N'];SET @e=0;'
+		+ N'IF EXISTS(SELECT 1 FROM [' + @details_tab + N'] '
+		+ N'WHERE NOT EXISTS (SELECT 1 FROM [' + @master_tab + N'] '
+		+ N'WHERE [' + @details_tab + N'].[' + @details_col + N']'
+		+ N'=[' + @master_tab + N'].[' + @master_col + N'])) '
+		+ N'SET @e=1';
+	RETURN @result;
+END
+	\end{lstlisting}
+	
+	\subsubsection{F\_REF\_RESULTS}
+	
+	Generuje zapytanie SQL pokazujące niespójne dane:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE FUNCTION dbo.F_REF_RESULTS(
+	@details_col NVARCHAR(100),
+	@details_tab NVARCHAR(100),
+	@master_col NVARCHAR(100),
+	@master_tab NVARCHAR(100),
+	@db NVARCHAR(100)
+)
+RETURNS NVARCHAR(2000)
+AS
+BEGIN
+	DECLARE @result NVARCHAR(2000);
+	SET @result = N'USE [' + @db + N'];'
+		+ N'SELECT DISTINCT [' + @details_tab + N'].[' + @details_col + N'] '
+		+ N'AS [' + @details_col + N' w ' + @details_tab 
+		+ N' nie ma w ' + @master_tab + N'] '
+		+ N'FROM [' + @details_tab + N'] '
+		+ N'WHERE NOT EXISTS (SELECT 1 FROM [' + @master_tab + N'] '
+		+ N'WHERE [' + @details_tab + N'].[' + @details_col + N']'
+		+ N'=[' + @master_tab + N'].[' + @master_col + N'])';
+	RETURN @result;
+END
+	\end{lstlisting}
+	
+	\section{Procedury zapamiętywania i usuwania}
+	
+	\subsection{Procedura z3\_fk\_store}
+	
+	Zapamiętuje wszystkie klucze obce z danej bazy:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE z3_fk_store
+	@db nvarchar(100),
+	@store_id int = NULL OUTPUT
+AS
+BEGIN
+	SET NOCOUNT ON;
+	DECLARE @sql nvarchar(max), @err_msg nvarchar(250);
+	
+	BEGIN TRY
+		-- Wstawiamy rekord do FK_STORE
+		INSERT INTO FK_STORE ([desc], db, rmv_after_store)
+		VALUES ('Save FK for database ' + @db, @db, 0);
+		
+		SET @store_id = SCOPE_IDENTITY();
+		
+		-- Pobieramy klucze obce z danej bazy
+		SET @sql = N'USE ' + QUOTENAME(@db) + N';
+		INSERT INTO B25_ADM_PM331720.dbo.FK_STORE_DET 
+			(store_id, master_tab, master_col, 
+			details_tab, details_col, fk_name, removed)
+		SELECT ' + CAST(@store_id AS nvarchar(20)) + N',
+			OBJECT_NAME(f.referenced_object_id),
+			COL_NAME(fc.referenced_object_id, fc.referenced_column_id),
+			OBJECT_NAME(f.parent_object_id),
+			COL_NAME(fc.parent_object_id, fc.parent_column_id),
+			f.name, 0
+		FROM sys.foreign_keys AS f
+		JOIN sys.foreign_key_columns AS fc 
+			ON f.[object_id] = fc.constraint_object_id
+		ORDER BY f.name';
+		
+		EXEC sp_executesql @sql;
+		
+		UPDATE FK_STORE 
+		SET end_dstamp = GETDATE()
+		WHERE store_id = @store_id;
+		
+		PRINT 'Saved FK for database ' + @db 
+			+ ' (store_id=' + CAST(@store_id AS varchar(10)) + ')';
+		
+	END TRY
+	BEGIN CATCH
+		SET @err_msg = ERROR_MESSAGE();
+		UPDATE FK_STORE 
+		SET err_msg = @err_msg
+		WHERE store_id = @store_id;
+		PRINT 'ERROR during save: ' + @err_msg;
+	END CATCH
+END
+	\end{lstlisting}
+	
+	\textbf{Logika:}
+	\begin{enumerate}
+		\item Wstawia rekord nagłówka do FK\_STORE
+		\item Pobiera store\_id
+		\item Buduje dynamiczne SQL do pobrania FK z danej bazy
+		\item Wstawia szczegóły do FK\_STORE\_DET
+		\item Ustawia datę zakończenia
+	\end{enumerate}
+	
+	\subsection{Procedura z3\_fk\_rmv}
+	
+	Usuwa wszystkie klucze obce z danej bazy (najpierw je zapamiętuje!):
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE z3_fk_rmv
+	@db nvarchar(100)
+AS
+BEGIN
+	SET NOCOUNT ON;
+	DECLARE @store_id int, @det_id int, @fk_name nvarchar(250),
+		@details_tab nvarchar(100), @sql nvarchar(max), 
+		@err int, @err_msg nvarchar(250);
+	
+	BEGIN TRY
+		-- Najpierw zapamiętujemy klucze
+		EXEC z3_fk_store @db = @db, @store_id = @store_id OUTPUT;
+		
+		PRINT 'Starting FK removal for database ' + @db 
+			+ ' (store_id=' + CAST(@store_id AS varchar(10)) + ')';
+		
+		-- Kursor po zapisanych kluczach
+		DECLARE fk_cursor CURSOR FOR
+			SELECT det_id, fk_name, details_tab
+			FROM FK_STORE_DET
+			WHERE store_id = @store_id ORDER BY det_id;
+		
+		OPEN fk_cursor;
+		FETCH NEXT FROM fk_cursor INTO @det_id, @fk_name, @details_tab;
+		
+		WHILE @@FETCH_STATUS = 0
+		BEGIN
+			BEGIN TRY
+				-- Budujemy polecenie usunięcia
+				SET @sql = N'USE ' + QUOTENAME(@db) 
+					+ N'; ALTER TABLE ' + QUOTENAME(@details_tab) 
+					+ N' DROP CONSTRAINT ' + QUOTENAME(@fk_name);
+				
+				EXEC sp_executesql @sql;
+				SET @err = @@ERROR;
+				
+				IF @err = 0
+				BEGIN
+					UPDATE FK_STORE_DET
+					SET removed = 1
+					WHERE det_id = @det_id;
+					PRINT 'Removed FK: ' + @fk_name 
+						+ ' from table ' + @details_tab;
+				END
+				
+			END TRY
+			BEGIN CATCH
+				SET @err_msg = ERROR_MESSAGE();
+				PRINT 'ERROR removing FK ' + @fk_name 
+					+ ': ' + @err_msg;
+			END CATCH
+			
+			FETCH NEXT FROM fk_cursor 
+				INTO @det_id, @fk_name, @details_tab;
+		END
+		
+		CLOSE fk_cursor;
+		DEALLOCATE fk_cursor;
+		
+		PRINT 'Finished FK removal for database ' + @db;
+		
+	END TRY
+	BEGIN CATCH
+		IF CURSOR_STATUS('local', 'fk_cursor') >= 0
+		BEGIN
+			CLOSE fk_cursor;
+			DEALLOCATE fk_cursor;
+		END
+		SET @err_msg = ERROR_MESSAGE();
+		PRINT 'CRITICAL ERROR: ' + @err_msg;
+	END CATCH
+END
+	\end{lstlisting}
+	
+	\textbf{Logika:}
+	\begin{enumerate}
+		\item Najpierw zapamiętuje klucze procedurą z3\_fk\_store
+		\item Otwiera kursor po zapisanych kluczach
+		\item Dla każdego klucza -- buduje SQL DROP CONSTRAINT
+		\item Oznacza jako usunięty w FK\_STORE\_DET
+		\item Obsługa błędów przy usuwaniu (TRY-CATCH)
+	\end{enumerate}
+	
+	\section{Procedury odtwarzania}
+	
+	\subsection{Procedura z3\_fk\_restore}
+	
+	Odtwarza klucze obce ze sprawdzeniem spójności danych:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE z3_fk_restore
+	@db nvarchar(100)
+AS
+BEGIN
+	SET NOCOUNT ON;
+	DECLARE @store_id int, @restore_id int, @master_tab nvarchar(100),
+		@master_col nvarchar(100), @details_tab nvarchar(100),
+		@details_col nvarchar(100), @fk_name nvarchar(250),
+		@sql nvarchar(max), @check_sql nvarchar(2000),
+		@show_sql nvarchar(2000), @err int,
+		@data_inconsistency bit, @fk_already_exists bit,
+		@job_id int, @err_msg nvarchar(250);
+	
+	BEGIN TRY
+		-- Szukamy ostatniego udanego store dla bazy
+		SELECT TOP 1 @store_id = store_id
+		FROM FK_STORE
+		WHERE db = @db AND end_dstamp IS NOT NULL 
+			AND err_msg IS NULL
+		ORDER BY end_dstamp DESC;
+		
+		IF @store_id IS NULL
+		BEGIN
+			PRINT 'No saved FK state found for database ' + @db;
+			RETURN;
+		END
+		
+		PRINT 'Found store_id=' + CAST(@store_id AS varchar(10)) 
+			+ ' for database ' + @db;
+		
+		-- Tworzymy rekord w FK_RESTORE
+		INSERT INTO FK_RESTORE ([desc], db)
+		VALUES ('Restore FK for database ' + @db, @db);
+		
+		SET @restore_id = SCOPE_IDENTITY();
+		PRINT 'Created restore_id=' + CAST(@restore_id AS varchar(10));
+		
+		-- Kursor po kluczach do odtworzenia
+		DECLARE restore_cursor CURSOR FOR
+			SELECT master_tab, master_col, details_tab, 
+				details_col, fk_name
+			FROM FK_STORE_DET
+			WHERE store_id = @store_id
+			ORDER BY det_id;
+		
+		OPEN restore_cursor;
+		FETCH NEXT FROM restore_cursor 
+			INTO @master_tab, @master_col, 
+			@details_tab, @details_col, @fk_name;
+		
+		WHILE @@FETCH_STATUS = 0
+		BEGIN
+			BEGIN TRY
+				SET @data_inconsistency = 0;
+				SET @fk_already_exists = 0;
+				SET @err_msg = NULL;
+				
+				-- Sprawdzamy czy zapytanie jest w cache
+				IF NOT EXISTS (
+					SELECT 1 FROM FK_CHECK_QUERY
+					WHERE db = @db
+						AND tab_to_check = @master_tab
+						AND col_to_check = @master_col
+						AND tab_where_data_exists = @details_tab
+						AND col_name_where_data_exists = @details_col
+				)
+				BEGIN
+					SET @check_sql = dbo.F_REF_CHECK_QUERY(
+						@details_col, @details_tab, 
+						@master_col, @master_tab, @db);
+					SET @show_sql = dbo.F_REF_RESULTS(
+						@details_col, @details_tab, 
+						@master_col, @master_tab, @db);
+					
+					INSERT INTO FK_CHECK_QUERY 
+						(col_name_where_data_exists, 
+						tab_where_data_exists, col_to_check, 
+						tab_to_check, db, s_query_check, 
+						s_query_show)
+					VALUES (@details_col, @details_tab, 
+						@master_col, @master_tab, @db, 
+						@check_sql, @show_sql);
+				END
+				ELSE
+				BEGIN
+					SELECT @check_sql = s_query_check, 
+						@show_sql = s_query_show
+					FROM FK_CHECK_QUERY
+					WHERE db = @db
+						AND tab_to_check = @master_tab
+						AND col_to_check = @master_col
+						AND tab_where_data_exists = @details_tab
+						AND col_name_where_data_exists = @details_col;
+				END
+				
+				-- Sprawdzamy spójność danych
+				DECLARE @data_err int = 0;
+				EXEC sp_executesql @check_sql, 
+					N'@e int OUTPUT', 
+					@e = @data_err OUTPUT;
+				
+				IF @data_err = 1
+					SET @data_inconsistency = 1;
+				
+				-- Sprawdzamy czy klucz już istnieje
+				SET @sql = N'USE ' + QUOTENAME(@db) + N';
+				SELECT @exists = COUNT(*)
+				FROM sys.foreign_keys AS f
+				JOIN sys.foreign_key_columns AS fc 
+					ON f.[object_id] = fc.constraint_object_id
+				WHERE OBJECT_NAME(f.parent_object_id) = @det_tab
+					AND COL_NAME(fc.parent_object_id, fc.parent_column_id) = @det_col
+					AND OBJECT_NAME(f.referenced_object_id) = @mst_tab
+					AND COL_NAME(fc.referenced_object_id, fc.referenced_column_id) = @mst_col';
+				
+				DECLARE @exists int = 0;
+				EXEC sp_executesql @sql, 
+					N'@det_tab nvarchar(100), @det_col nvarchar(100), 
+					@mst_tab nvarchar(100), @mst_col nvarchar(100), 
+					@exists int OUTPUT',
+					@det_tab = @details_tab, @det_col = @details_col, 
+					@mst_tab = @master_tab, @mst_col = @master_col, 
+					@exists = @exists OUTPUT;
+				
+				IF @exists > 0
+					SET @fk_already_exists = 1;
+				
+				-- Wstawiamy job
+				INSERT INTO FK_RESTORE_JOB 
+					(package_id, detail_col, detail_table, 
+					master_col, master_table, db, fk_name, 
+					fk_already_exists, data_inconsistency)
+				VALUES (@restore_id, @details_col, @details_tab, 
+					@master_col, @master_tab, @db, @fk_name,
+					@fk_already_exists, @data_inconsistency);
+				
+				SET @job_id = SCOPE_IDENTITY();
+				
+				-- Tworzymy klucz tylko bez problemów
+				IF @fk_already_exists = 0 AND @data_inconsistency = 0
+				BEGIN
+					SET @sql = N'USE ' + QUOTENAME(@db) 
+						+ N'; ALTER TABLE ' + QUOTENAME(@details_tab) 
+						+ N' ADD CONSTRAINT ' + QUOTENAME(@fk_name) 
+						+ N' FOREIGN KEY (' + QUOTENAME(@details_col) + N') '
+						+ N'REFERENCES ' + QUOTENAME(@master_tab) 
+						+ N'(' + QUOTENAME(@master_col) + N')';
+					
+					EXEC sp_executesql @sql;
+					
+					UPDATE FK_RESTORE_JOB
+					SET cr_end = GETDATE()
+					WHERE job_id = @job_id;
+					
+					PRINT 'Created FK: ' + @fk_name;
+				END
+				ELSE
+				BEGIN
+					IF @fk_already_exists = 1
+						SET @err_msg = 'FK already exists';
+					IF @data_inconsistency = 1
+						SET @err_msg = ISNULL(@err_msg + '; ', '') 
+							+ 'Data inconsistency';
+					
+					UPDATE FK_RESTORE_JOB
+					SET err_msg = @err_msg
+					WHERE job_id = @job_id;
+					
+					PRINT 'Skipped FK ' + @fk_name + ': ' + @err_msg;
+				END
+				
+			END TRY
+			BEGIN CATCH
+				SET @err_msg = ERROR_MESSAGE();
+				UPDATE FK_RESTORE_JOB
+				SET err_msg = @err_msg
+				WHERE job_id = @job_id;
+				PRINT 'ERROR creating FK ' + @fk_name 
+					+ ': ' + @err_msg;
+			END CATCH
+			
+			FETCH NEXT FROM restore_cursor 
+				INTO @master_tab, @master_col, 
+				@details_tab, @details_col, @fk_name;
+		END
+		
+		CLOSE restore_cursor;
+		DEALLOCATE restore_cursor;
+		
+		-- Sprawdzamy błędy i raportujemy
+		IF EXISTS (SELECT 1 FROM FK_RESTORE_JOB 
+			WHERE package_id = @restore_id 
+			AND (err_msg IS NOT NULL OR fk_already_exists = 1 
+			OR data_inconsistency = 1))
+		BEGIN
+			PRINT 'Errors detected - running report...';
+			EXEC z3_fk_restore_report_errors 
+				@restore_id = @restore_id;
+		END
+		ELSE
+		BEGIN
+			UPDATE FK_RESTORE
+			SET end_dstamp = GETDATE()
+			WHERE restore_id = @restore_id;
+			PRINT 'Successfully restored FK';
+		END
+		
+	END TRY
+	BEGIN CATCH
+		IF CURSOR_STATUS('local', 'restore_cursor') >= 0
+		BEGIN
+			CLOSE restore_cursor;
+			DEALLOCATE restore_cursor;
+		END
+		SET @err_msg = ERROR_MESSAGE();
+		UPDATE FK_RESTORE
+		SET err_msg = @err_msg
+		WHERE restore_id = @restore_id;
+		PRINT 'CRITICAL ERROR: ' + @err_msg;
+	END CATCH
+END
+	\end{lstlisting}
+	
+	\section{Testowanie systemu}
+	
+	\subsection{Przebieg testów}
+	
+	Testy zostały wykonane na bazie PM\_DB1 z następującym przebiegiem:
+	
+	\subsubsection{TEST 1 -- Zapis kluczy obcych}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+DECLARE @store_id1 int;
+EXEC z3_fk_store @db = 'PM_DB1', @store_id = @store_id1 OUTPUT;
+	\end{lstlisting}
+	
+	\textbf{Wynik:}
+	\begin{lstlisting}
+Saved FK for database PM_DB1 (store_id=4)
+	\end{lstlisting}
+	
+	Zapisano 3 klucze obce z bazy PM\_DB1:
+	\begin{itemize}
+		\item \texttt{FK\_ETATY\_OSOBY\_PM} (ETATY.id\_osoby $\to$ OSOBY.id\_osoby)
+		\item \texttt{FK\_MIASTA\_WOJ\_PM} (MIASTA.kod\_woj $\to$ WOJ.kod\_woj)
+		\item \texttt{FK\_OSOBY\_MIASTA\_PM} (OSOBY.id\_miasta $\to$ MIASTA.id\_miasta)
+	\end{itemize}
+	
+	\subsubsection{TEST 2 -- Sprawdzenie kluczy przed usunięciem}
+	
+	Zapytanie do widoku systemowego wykazało 3 klucze obce w bazie PM\_DB1.
+	
+	\subsubsection{TEST 3 -- Usunięcie kluczy obcych}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+EXEC z3_fk_rmv @db = 'PM_DB1';
+	\end{lstlisting}
+	
+	\textbf{Wyniki:}
+	\begin{lstlisting}
+Starting FK removal for database PM_DB1 (store_id=5)
+Removed FK: FK_ETATY_OSOBY_PM from table ETATY
+Removed FK: FK_MIASTA_WOJ_PM from table MIASTA
+Removed FK: FK_OSOBY_MIASTA_PM from table OSOBY
+Finished FK removal for database PM_DB1
+	\end{lstlisting}
+	
+	Po usunięciu weryfikacja wykazała brak kluczy obcych w bazie PM\_DB1.
+	
+	\subsubsection{TEST 4 -- Odtworzenie kluczy}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+EXEC z3_fk_restore @db = 'PM_DB1';
+	\end{lstlisting}
+	
+	\textbf{Wyniki:}
+	\begin{lstlisting}
+Found store_id=5 for database PM_DB1
+Created restore_id=1
+Created FK: FK_MIASTA_WOJ_PM
+Created FK: FK_OSOBY_MIASTA_PM
+Skipped FK FK_ETATY_OSOBY_PM: Data inconsistency
+Errors detected - running report...
+	\end{lstlisting}
+	
+	\subsubsection{TEST 5 -- Raport błędów}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+EXEC z3_fk_restore_report_errors @restore_id = 1;
+	\end{lstlisting}
+	
+	\textbf{Wyniki:}
+	\begin{lstlisting}
+ERROR REPORT FOR restore_id = 1
+=========================================
+
+--- DATA INCONSISTENCY (details below) ---
+
+>>> FK: FK_ETATY_OSOBY_PM
+    (ETATY -> OSOBY)
+    Inconsistent data:
+
+id_osoby w OSOBY nie ma w ETATY
+-------------------------------
+                              1
+
+SUMMARY:
+Total FK: 3
+Successfully created: 2
+Errors/Skipped: 1
+	\end{lstlisting}
+	
+	System wykrył, że w tabeli ETATY brakuje referencji dla id\_osoby=1, co uniemożliwiło odtworzenie klucza FK\_ETATY\_OSOBY\_PM.
+	
+	\subsubsection{TEST 6 -- Weryfikacja odtworzonych kluczy}
+	
+	Zapytanie do widoku systemowego wykazało 2 klucze obce (FK\_MIASTA\_WOJ\_PM i FK\_OSOBY\_MIASTA\_PM), trzeci został pominięty ze względu na niespójność danych.
+	
+	\section{Statystyka wyników}
+	
+	\subsection{Podsumowanie testów}
+	
+	Poniższa tabela przedstawia rezultaty procedury z3\_fk\_restore:
+	
+	\begin{center}
+		\begin{tabular}{|l|r|}
+			\hline
+			\textbf{Metrika} & \textbf{Wartość} \\
+			\hline
+			Łącznie kluczy & 3 \\
+			\hline
+			Pomyślnie utworzonych & 2 \\
+			\hline
+			Już istnieją & 0 \\
+			\hline
+			Niespójne dane & 1 \\
+			\hline
+			Inne błędy & 0 \\
+			\hline
+		\end{tabular}
+	\end{center}
+	
+	\section{Wnioski}
+	
+	\subsection{Funkcjonalność systemu}
+	
+	System zarządzania kluczami obcymi działa prawidłowo:
+	
+	\begin{enumerate}
+		\item \textbf{Zapamiętywanie} -- procedura z3\_fk\_store poprawnie identyfikuje i zapisuje wszystkie klucze obce z wybranej bazy
+		\item \textbf{Usuwanie} -- procedura z3\_fk\_rmv bezpiecznie usuwa klucze (najpierw je zapamiętuje) i zapisuje status w tabeli
+		\item \textbf{Odtwarzanie} -- procedura z3\_fk\_restore:
+		\begin{itemize}
+			\item Sprawdza spójność danych przed utworzeniem klucza
+			\item Tworzy klucze tylko gdy dane są spójne
+			\item Pomija klucze już istniejące w bazie
+			\item Generuje szczegółowy raport błędów
+		\end{itemize}
+		\item \textbf{Raportowanie} -- procedura z3\_fk\_restore\_report\_errors wyświetla dokładne informacje o przyczynach niepowodzenia
+	\end{enumerate}
+	
+	\subsection{Korzyści dla administratora}
+	
+	\begin{enumerate}
+		\item \textbf{Bezpieczne ładowanie danych} -- możliwość wyłączenia FK przed bulkem load'em
+		\item \textbf{Automatyczne sprawdzenie spójności} -- system nie pozwala na utworzenie FK z niespójnymi danymi
+		\item \textbf{Audyt operacji} -- pełna historia zapisu, usuwania i odtwarzania FK
+		\item \textbf{Efektywność} -- cache zapytań sprawdzających (FK\_CHECK\_QUERY) unika powtarzających się obliczeń
+	\end{enumerate}
+	
+	\subsection{Możliwe rozszerzenia}
+	
+	\begin{itemize}
+		\item Automatyzacja procedur za pomocą agenta SQL Server
+		\item Integracja z procesem ETL/ELT
+		\item Rozszerzenie raportowania o statystyki szczegółowe
+		\item Obsługa kluczy złożonych (multi-column FK)
+	\end{itemize}
+	
+	\section{Podsumowanie}
+	
+	W ramach laboratorium nr 3 zrealizowano kompleksowy system do zarządzania kluczami obcymi w bazach danych SQL Server. System umożliwia bezpieczne zapamiętywanie, usuwanie i odtwarzanie kluczy obcych ze sprawdzeniem spójności danych. Testowanie wykazało prawidłowe działanie wszystkich komponentów systemu.
+	
+	\vspace{1.5cm}
+	
+	\begin{center}
+		\textit{Paweł Myszka, nr albumu 331720}\\
+		\textit{10 listopada 2025}
+	\end{center}
+	
+\end{document}

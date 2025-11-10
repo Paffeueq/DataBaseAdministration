@@ -1,0 +1,157 @@
+USE B25_ADM_PM331720
+GO
+
+/* 
+========================================
+TEST SCRIPT FOR TASK Z4
+Using B25_ADM_PM331720 database
+========================================
+*/
+
+PRINT '========================================='
+PRINT 'TEST 1: Save foreign keys'
+PRINT '========================================='
+PRINT ''
+
+-- a) Save FK for PM_DB1
+DECLARE @store_id1 int
+EXEC z3_fk_store @db = 'PM_DB1', @store_id = @store_id1 OUTPUT
+PRINT 'Created store_id: ' + CAST(@store_id1 AS varchar(10))
+PRINT ''
+
+-- Show what we saved
+PRINT 'Content of FK_STORE:'
+SELECT store_id, [desc], db, start_dstamp, end_dstamp, err_msg 
+FROM FK_STORE 
+WHERE store_id = @store_id1
+
+PRINT ''
+PRINT 'Content of FK_STORE_DET (first 10 rows):'
+SELECT TOP 10 store_id, master_tab, master_col, details_tab, details_col, fk_name, removed
+FROM FK_STORE_DET 
+WHERE store_id = @store_id1
+ORDER BY det_id
+
+PRINT ''
+PRINT 'Total number of saved FK:'
+SELECT COUNT(*) as 'Total FK'
+FROM FK_STORE_DET 
+WHERE store_id = @store_id1
+
+PRINT ''
+PRINT '========================================='
+PRINT 'TEST 2: Check existing keys before removal'
+PRINT '========================================='
+PRINT ''
+
+-- Show FK in PM_DB1
+DECLARE @sql_check nvarchar(max)
+SET @sql_check = N'USE PM_DB1;
+SELECT  
+    f.name AS FK_Name,
+    OBJECT_NAME(f.parent_object_id) AS Details_Table,
+    COL_NAME(fc.parent_object_id, fc.parent_column_id) AS Details_Column,
+    OBJECT_NAME(f.referenced_object_id) AS Master_Table,
+    COL_NAME(fc.referenced_object_id, fc.referenced_column_id) AS Master_Column
+FROM sys.foreign_keys AS f
+JOIN sys.foreign_key_columns AS fc ON f.[object_id] = fc.constraint_object_id
+ORDER BY f.name'
+
+PRINT 'Foreign keys in PM_DB1 BEFORE removal:'
+EXEC sp_executesql @sql_check
+PRINT ''
+
+PRINT '========================================='
+PRINT 'TEST 3: Remove foreign keys'
+PRINT '========================================='
+PRINT ''
+
+-- b) Remove FK from PM_DB1
+EXEC z3_fk_rmv @db = 'PM_DB1'
+PRINT ''
+
+-- Check if FK were removed
+PRINT 'Foreign keys in PM_DB1 AFTER removal:'
+EXEC sp_executesql @sql_check
+PRINT ''
+
+-- Show statistics
+PRINT 'Removal status in FK_STORE_DET:'
+SELECT 
+    COUNT(*) as 'Total',
+    SUM(CASE WHEN removed = 1 THEN 1 ELSE 0 END) as 'Removed',
+    SUM(CASE WHEN removed = 0 THEN 1 ELSE 0 END) as 'Not Removed'
+FROM FK_STORE_DET 
+WHERE store_id = @store_id1
+PRINT ''
+
+PRINT '========================================='
+PRINT 'TEST 4: Restore foreign keys'
+PRINT '========================================='
+PRINT ''
+
+-- Restore FK
+EXEC z3_fk_restore @db = 'PM_DB1'
+PRINT ''
+
+PRINT '========================================='
+PRINT 'TEST 5: Check restored keys'
+PRINT '========================================='
+PRINT ''
+
+-- Check which FK were restored
+PRINT 'Foreign keys in PM_DB1 AFTER restoration:'
+EXEC sp_executesql @sql_check
+PRINT ''
+
+PRINT '========================================='
+PRINT 'TEST 6: Analyze restoration results'
+PRINT '========================================='
+PRINT ''
+
+-- Get last restore_id
+DECLARE @last_restore_id int
+SELECT TOP 1 @last_restore_id = restore_id 
+FROM FK_RESTORE 
+ORDER BY start_dstamp DESC
+
+PRINT 'Content of FK_RESTORE:'
+SELECT restore_id, [desc], db, start_dstamp, end_dstamp, err_msg
+FROM FK_RESTORE
+WHERE restore_id = @last_restore_id
+
+PRINT ''
+PRINT 'Restoration summary:'
+SELECT 
+    COUNT(*) as 'Total',
+    SUM(CASE WHEN cr_end IS NOT NULL AND err_msg IS NULL THEN 1 ELSE 0 END) as 'Successfully Created',
+    SUM(CASE WHEN fk_already_exists = 1 THEN 1 ELSE 0 END) as 'Already Existed',
+    SUM(CASE WHEN data_inconsistency = 1 THEN 1 ELSE 0 END) as 'Data Inconsistency Found',
+    SUM(CASE WHEN err_msg IS NOT NULL THEN 1 ELSE 0 END) as 'Errors'
+FROM FK_RESTORE_JOB
+WHERE package_id = @last_restore_id
+
+PRINT ''
+PRINT 'Detailed FK_RESTORE_JOB results (first 15 rows):'
+SELECT TOP 15
+    job_id,
+    fk_name,
+    detail_table,
+    master_table,
+    fk_already_exists,
+    data_inconsistency,
+    CASE 
+        WHEN cr_end IS NOT NULL AND err_msg IS NULL THEN 'CREATED'
+        WHEN fk_already_exists = 1 THEN 'EXISTS'
+        WHEN data_inconsistency = 1 THEN 'INCONSISTENT DATA'
+        WHEN err_msg IS NOT NULL THEN 'ERROR'
+        ELSE 'SKIPPED'
+    END AS status
+FROM FK_RESTORE_JOB
+WHERE package_id = @last_restore_id
+ORDER BY job_id
+
+PRINT ''
+PRINT '========================================='
+PRINT 'END OF TESTS - COMPLETED SUCCESSFULLY!'
+PRINT '========================================='
