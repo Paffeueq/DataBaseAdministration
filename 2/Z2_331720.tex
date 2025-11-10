@@ -1,0 +1,665 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[polish]{babel}
+\usepackage{graphicx}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage[margin=2.5cm]{geometry}
+
+\lstset{
+	basicstyle=\ttfamily\footnotesize,
+	breaklines=true,
+	frame=single,
+	backgroundcolor=\color{gray!10},
+	xleftmargin=5pt,
+	framexleftmargin=5pt,
+	numbers=left,
+	numberstyle=\tiny\color{gray},
+	keywordstyle=\color{blue}\bfseries,
+	commentstyle=\color{green!60!black},
+	stringstyle=\color{red}
+}
+
+\title{Laboratorium nr 2 -- Administracja BD\\
+	\large Monitorowanie liczby rekordów w bazach danych}
+\author{Paweł Myszka\\
+	Nr albumu: 331720}
+\date{27 października 2025}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Z2 -- 331720}
+\fancyhead[C]{Administracja Bazami Danych}
+\fancyhead[R]{Paweł Myszka}
+\fancyfoot[C]{\thepage\ / \pageref{LastPage}}
+
+\begin{document}
+	
+	\maketitle
+	\thispagestyle{fancy}
+	
+	\section{Cel laboratorium}
+	
+	Celem laboratorium było stworzenie systemu monitorowania liczby rekordów w tabelach użytkownika. System składa się z:
+	\begin{itemize}
+		\item Bazy administracyjnej przechowującej historię pomiarów
+		\item Procedur automatyzujących proces zbierania danych
+		\item Procedur analitycznych do wyświetlania historii i statystyk przyrostów
+	\end{itemize}
+	
+	\section{Zadanie 1 -- Tworzenie baz danych}
+	
+	\begin{lstlisting}[language=SQL]
+DECLARE @i INT = 1;
+WHILE @i <= 5
+BEGIN
+DECLARE @dbname SYSNAME = N'PM_DB' + CAST(@i AS NVARCHAR(4));
+IF DB_ID(@dbname) IS NULL
+BEGIN
+DECLARE @sql NVARCHAR(MAX) = 
+N'CREATE DATABASE ' + QUOTENAME(@dbname) +
+N' ON (NAME = N''' + @dbname + N'_Data'', 
+FILENAME = N''D:\stud\sem 5\AdminBazDa\2\' 
++ @dbname + N'_Data.mdf'', 
+SIZE = 20MB, MAXSIZE = 200MB, FILEGROWTH = 10MB)';
+EXEC(@sql);
+END
+SET @i = @i + 1;
+END
+	\end{lstlisting}
+	
+	Utworzone bazy: \texttt{PM\_DB1}, \texttt{PM\_DB2}, \texttt{PM\_DB3}, \texttt{PM\_DB4}, \texttt{PM\_DB5}.
+	
+	\section{Zadanie 2 -- Utworzenie tabel w bazach}
+	
+	W bazach \texttt{PM\_DB1}, \texttt{PM\_DB2}, \texttt{PM\_DB3} utworzono strukturę tabel:
+	
+	\begin{itemize}
+		\item \texttt{WOJ} -- województwa (3 rekordy)
+		\item \texttt{MIASTA} -- miasta (4 rekordy)
+		\item \texttt{OSOBY} -- osoby (5 rekordów bazowych)
+		\item \texttt{ETATY} -- etaty (4 rekordy bazowe)
+	\end{itemize}
+	
+	Wykorzystano procedurę \texttt{pr\_seed\_pm331720}, która dynamicznie tworzy tabele i wypełnia je danymi.
+
+	
+	\section{Zadanie 3 -- Dodanie rekordów w PM\_DB3}
+	
+	W bazie \texttt{PM\_DB3} dodano dodatkowe rekordy:
+	
+	\begin{lstlisting}[language=SQL]
+USE PM_DB3;
+INSERT INTO dbo.OSOBY(id_miasta, imie, nazwisko)
+VALUES
+((SELECT TOP 1 id_miasta FROM dbo.MIASTA 
+WHERE nazwa='WARSZAWA'),'Piotr','Górski'),
+((SELECT TOP 1 id_miasta FROM dbo.MIASTA 
+WHERE nazwa='WARSZAWA'),'Agnieszka','Leśna');
+		
+-- Dodanie 3 dodatkowych etatów
+DECLARE @idp INT = (SELECT TOP 1 id_osoby FROM dbo.OSOBY 
+WHERE imie='Piotr' AND nazwisko='Górski');
+DECLARE @ida INT = (SELECT TOP 1 id_osoby FROM dbo.OSOBY 
+WHERE imie='Agnieszka' AND nazwisko='Leśna');
+		
+INSERT INTO dbo.ETATY(id_osoby, stanowisko, pensja, [od])
+VALUES
+(@idp, 'Kierownik',  11000, '20240101'),
+(@idp, 'Koordynator', 8000, '20230101'),
+(@ida, 'Młodszy Specjalista', 4200, '20230215');
+	\end{lstlisting}
+	
+	Po dodaniu rekordów:
+	\begin{itemize}
+		\item \texttt{OSOBY}: 5 + 2 = \textbf{7 rekordów}
+		\item \texttt{ETATY}: 4 + 3 = \textbf{7 rekordów}
+	\end{itemize}
+	
+	\section{Zadanie 4 -- Śledzenie liczby rekordów}
+	
+	\subsection{4.1 -- Utworzenie tabel administracyjnych}
+	
+	Utworzono bazę \texttt{B25\_ADM\_PM331720} z dwiema tabelami:
+	
+	\begin{lstlisting}[language=SQL]
+USE B25_ADM_PM331720;
+GO
+		
+CREATE TABLE dbo.DB_CHECK (
+check_id INT IDENTITY(1,1) PRIMARY KEY,
+db_nam   NVARCHAR(100) NOT NULL,
+d_stamp  DATETIME NOT NULL DEFAULT GETDATE(),
+opis     NVARCHAR(200) NOT NULL,
+[usr]    NVARCHAR(128) NOT NULL DEFAULT USER_NAME(),
+[s_usr]  NVARCHAR(128) NOT NULL DEFAULT SUSER_NAME()
+);
+		
+CREATE TABLE dbo.DB_CHECK_ITEMS (
+check_id INT NOT NULL,
+tb_nam   NVARCHAR(256) NOT NULL,
+liczba_reordow INT NOT NULL,
+tb_check_d_stamp DATETIME NOT NULL DEFAULT GETDATE(),
+CONSTRAINT FK_DB_CHECK_ITEMS__DB_CHECK 
+FOREIGN KEY (check_id) REFERENCES dbo.DB_CHECK(check_id)
+);
+	\end{lstlisting}
+	
+	\textbf{Struktura danych:}
+	\begin{itemize}
+		\item \texttt{DB\_CHECK} -- główna tabela z informacją o wykonaniu snapshotu (kto, kiedy, która baza)
+		\item \texttt{DB\_CHECK\_ITEMS} -- szczegóły: liczba rekordów w każdej tabeli dla danego snapshotu
+	\end{itemize}
+	
+	\subsection{4.2 -- Procedura monitorująca pojedynczą bazę}
+	
+	Procedura \texttt{pr\_pm\_check\_one} dla podanej bazy:
+	\begin{enumerate}
+		\item Wstawia rekord do \texttt{DB\_CHECK} i pobiera \texttt{check\_id}
+		\item Iteruje po wszystkich tabelach użytkownika
+		\item Zlicza rekordy używając \texttt{sys.partitions}
+		\item Zapisuje wyniki w \texttt{DB\_CHECK\_ITEMS}
+	\end{enumerate}
+	
+	\begin{lstlisting}
+CREATE PROCEDURE dbo.pr_pm_check_one
+@db sysname,
+@opis NVARCHAR(200) = N'PM331720 - snapshot pojedynczej bazy'
+AS
+BEGIN
+SET NOCOUNT ON;
+		
+-- Walidacja istnienia bazy
+IF DB_ID(@db) IS NULL 
+BEGIN 
+RAISERROR(N'Baza %s nie istnieje.',16,1,@db); 
+RETURN; 
+END
+	
+-- Wstawienie rekordu z informacją o snaphocie
+INSERT INTO dbo.DB_CHECK(db_nam, opis) VALUES (@db, @opis);
+DECLARE @check_id INT = SCOPE_IDENTITY();
+		
+-- Dynamiczne SQL zliczające rekordy we wszystkich tabelach
+DECLARE @sql NVARCHAR(MAX) = N'
+INSERT INTO dbo.DB_CHECK_ITEMS(check_id, tb_nam, liczba_reordow)
+SELECT ' + CAST(@check_id AS NVARCHAR(12)) + N', 
+QUOTENAME(s.name) + ''.'' + QUOTENAME(t.name),
+CAST(SUM(CASE WHEN p.index_id IN (0,1) 
+THEN p.[rows] ELSE 0 END) AS INT)
+FROM ' + QUOTENAME(@db) + N'.sys.tables t
+JOIN ' + QUOTENAME(@db) + N'.sys.schemas s 
+ON s.schema_id = t.schema_id
+JOIN ' + QUOTENAME(@db) + N'.sys.partitions p 
+ON p.[object_id] = t.[object_id]
+WHERE t.is_ms_shipped = 0
+GROUP BY s.name, t.name
+ORDER BY s.name, t.name;';
+		
+EXEC sys.sp_executesql @sql;
+END
+	\end{lstlisting}
+	
+	\textbf{Uwaga:} Użyto \texttt{sys.partitions} zamiast \texttt{COUNT(*)} dla wydajności -- nie wymaga skanowania całej tabeli.
+	
+	\subsubsection{Przykład użycia}
+	
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.pr_pm_check_one @db = N'PM_DB1';
+	\end{lstlisting}
+	
+	\subsubsection{Wyniki działania}
+	
+	Tabela \texttt{DB\_CHECK}:
+	\begin{lstlisting}
+check_id  db_nam   d_stamp                   opis
+--------  -------  ------------------------  --------------------------
+1         PM_DB1   2025-10-27 21:03:50.553   PM331720 - snapshot ...
+	\end{lstlisting}
+	
+	Tabela \texttt{DB\_CHECK\_ITEMS}:
+	\begin{lstlisting}
+check_id  tb_nam           liczba_reordow
+--------  ---------------  --------------
+1         [dbo].[WOJ]      3
+1         [dbo].[MIASTA]   4
+1         [dbo].[OSOBY]    5
+1         [dbo].[ETATY]    4
+	\end{lstlisting}
+	
+	\subsection{4.3 -- Procedura monitorująca wszystkie bazy}
+	
+	Procedura \texttt{pr\_pm\_check\_all} używa kursora do iteracji po wszystkich bazach użytkownika (z wyłączeniem systemowych i administracyjnej):
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.pr_pm_check_all
+@opis NVARCHAR(200) = N'PM331720 - snapshot wszystkich user DB'
+AS
+BEGIN
+SET NOCOUNT ON;
+DECLARE @db sysname;
+		
+-- Kursor po bazach użytkownika
+DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+SELECT name FROM sys.databases
+WHERE name NOT IN (N'master', N'model', N'msdb', 
+N'tempdb', N'B25_ADM_PM331720')
+AND state = 0 AND is_read_only = 0 
+AND name LIKE N'PM_DB%';
+		
+OPEN cur;
+FETCH NEXT FROM cur INTO @db;
+		
+WHILE @@FETCH_STATUS = 0
+BEGIN
+BEGIN TRY
+-- Wywołanie procedury dla pojedynczej bazy
+EXEC dbo.pr_pm_check_one @db=@db, @opis=@opis;
+PRINT N'Zliczono tabele w bazie: ' + @db;
+END TRY
+BEGIN CATCH
+PRINT N'Pominięto bazę ' + @db + N': ' + ERROR_MESSAGE();
+END CATCH;
+		
+FETCH NEXT FROM cur INTO @db;
+END
+		
+CLOSE cur; 
+DEALLOCATE cur;
+END
+	\end{lstlisting}
+	
+	\textbf{Logika działania:}
+	\begin{enumerate}
+		\item Kursor iteruje po wszystkich bazach z prefiksem \texttt{PM\_DB}
+		\item Dla każdej bazy wywołuje \texttt{pr\_pm\_check\_one}
+		\item Obsługa błędów (TRY-CATCH) -- jeśli baza jest niedostępna, procedura kontynuuje pracę
+		\item Informuje o sukcesie/porażce dla każdej bazy
+	\end{enumerate}
+	
+	\subsubsection{Przykład użycia}
+	
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.pr_pm_check_all;
+	\end{lstlisting}
+	
+	\subsubsection{Wyniki}
+	
+	Komunikaty w konsoli:
+	\begin{lstlisting}
+Zliczono tabele w bazie: PM_DB1
+Zliczono tabele w bazie: PM_DB2
+Zliczono tabele w bazie: PM_DB3
+	\end{lstlisting}
+	
+	Dane w \texttt{DB\_CHECK\_ITEMS} (fragment):
+	\begin{lstlisting}
+check_id  tb_nam           liczba_reordow
+--------  ---------------  --------------
+2         [dbo].[WOJ]      3
+2         [dbo].[MIASTA]   4
+2         [dbo].[OSOBY]    5
+2         [dbo].[ETATY]    4
+3         [dbo].[WOJ]      3
+3         [dbo].[MIASTA]   4
+3         [dbo].[OSOBY]    7
+3         [dbo].[ETATY]    7
+	\end{lstlisting}
+	
+	\subsection{4.4 -- Procedura wyświetlająca historię tabeli}
+	
+	Procedura \texttt{pr\_pm\_history} wyświetla wszystkie pomiary dla podanej tabeli w podanej bazie:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.pr_pm_history
+@db sysname,
+@table NVARCHAR(256)
+AS
+BEGIN
+SET NOCOUNT ON;
+		
+-- Normalizacja nazwy tabeli (usunięcie nawiasów kwadratowych)
+DECLARE @t_norm NVARCHAR(256) = 
+REPLACE(REPLACE(@table, N'[', N''), N']', N'');
+		
+-- Parsowanie schematu i nazwy tabeli
+DECLARE @schema SYSNAME, @tab SYSNAME;
+IF CHARINDEX('.', @t_norm) > 0
+BEGIN
+SET @schema = PARSENAME(@t_norm, 2);
+SET @tab    = PARSENAME(@t_norm, 1);
+END
+ELSE
+BEGIN
+SET @schema = N'dbo';
+SET @tab = @t_norm;
+END
+		
+-- Wyszukanie wszystkich pomiarów z różnymi wariantami nazw
+DECLARE @tb_quoted NVARCHAR(300) = 
+QUOTENAME(@schema) + N'.' + QUOTENAME(@tab);
+DECLARE @tab_only_q NVARCHAR(300) = QUOTENAME(@tab);
+DECLARE @tb_plain NVARCHAR(300) = @schema + N'.' + @tab;
+		
+SELECT c.db_nam, i.tb_nam, c.check_id, 
+c.d_stamp, i.liczba_reordow
+FROM dbo.DB_CHECK c
+JOIN dbo.DB_CHECK_ITEMS i ON i.check_id = c.check_id
+WHERE c.db_nam = @db
+AND (i.tb_nam = @tb_quoted
+OR i.tb_nam = @tab_only_q
+OR REPLACE(REPLACE(i.tb_nam, N'[', N''), N']', N'') 
+IN (@tb_plain, @tab))
+ORDER BY c.d_stamp, c.check_id;
+		
+IF @@ROWCOUNT = 0
+RAISERROR(N'Brak historii dla bazy %s i tabeli %s', 
+16, 1, @db, @table);
+END
+	\end{lstlisting}
+
+	
+	\subsubsection{Przykład użycia}
+	
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.pr_pm_history @db='PM_DB3', @table='OSOBY';
+	\end{lstlisting}
+	
+	\subsubsection{Przykładowe wyniki}
+	
+	\begin{lstlisting}
+db_nam  tb_nam         check_id  d_stamp                   liczba_reordow
+------  -------------  --------  ------------------------  --------------
+PM_DB3  [dbo].[OSOBY]  5         2025-10-27 20:15:30.120   5
+PM_DB3  [dbo].[OSOBY]  8         2025-10-27 21:10:45.333   7
+PM_DB3  [dbo].[OSOBY]  12        2025-10-27 22:05:12.887   7
+	\end{lstlisting}
+	
+	Historia pokazuje, że w bazie \texttt{PM\_DB3} tabela \texttt{OSOBY} początkowo miała 5 rekordów, a po dodaniu dwóch osób (Piotr Górski, Agnieszka Leśna) ma 7 rekordów.
+	
+	\subsection{4.5 -- Procedura porównująca dwa snapshoty}
+	
+	Procedura \texttt{pr\_pm\_stats} porównuje dwa pomiary i oblicza przyrosty:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.pr_pm_stats
+@check_id_1 INT,
+@check_id_2 INT
+AS
+BEGIN
+SET NOCOUNT ON;
+		
+-- a) Walidacja check_id
+IF NOT EXISTS(SELECT 1 FROM dbo.DB_CHECK 
+WHERE check_id = @check_id_1)
+OR NOT EXISTS(SELECT 1 FROM dbo.DB_CHECK 
+WHERE check_id = @check_id_2)
+BEGIN
+RAISERROR(N'Check_id nie istniej w B25_ADM_PM331720.dbo.DB_CHECK',
+16, 3);
+RETURN;
+END
+		
+-- b) Połączenie danych z dwóch pomiarów i obliczenie przyrostów
+;WITH c1 AS (
+SELECT c.db_nam, i.tb_nam, i.liczba_reordow
+FROM dbo.DB_CHECK c 
+JOIN dbo.DB_CHECK_ITEMS i ON i.check_id = c.check_id
+WHERE c.check_id = @check_id_1
+),
+c2 AS (
+SELECT c.db_nam, i.tb_nam, i.liczba_reordow
+FROM dbo.DB_CHECK c 
+JOIN dbo.DB_CHECK_ITEMS i ON i.check_id = c.check_id
+WHERE c.check_id = @check_id_2
+),
+j AS (
+SELECT COALESCE(c2.db_nam, c1.db_nam) AS baza,
+COALESCE(c2.tb_nam, c1.tb_nam) AS tabela,
+ISNULL(c1.liczba_reordow, 0) AS liczba_reordow_dla_check_1,
+ISNULL(c2.liczba_reordow, 0) AS liczba_reordow_dla_check_2,
+ISNULL(c2.liczba_reordow, 0) - ISNULL(c1.liczba_reordow, 0) 
+AS przyrost
+FROM c1 FULL OUTER JOIN c2
+ON c1.db_nam = c2.db_nam AND c1.tb_nam = c2.tb_nam
+)
+-- Zwrócenie szczegółowej tabeli z przyrostami
+SELECT baza, tabela, liczba_reordow_dla_check_1, 
+liczba_reordow_dla_check_2, przyrost
+FROM j 
+ORDER BY baza, tabela;
+		
+;WITH mx AS (
+SELECT baza, tabela, przyrost,
+ROW_NUMBER() OVER (PARTITION BY baza 
+ORDER BY przyrost DESC, tabela) AS rn
+FROM j
+)
+SELECT baza, tabela AS najwiekszy_przyrost_w_bazie_pomiedzy_check1_i_check2
+FROM mx 
+WHERE rn = 1 
+ORDER BY baza;
+END
+	\end{lstlisting}
+	
+	\textbf{Kluczowe elementy:}
+	\begin{itemize}
+		\item \textbf{FULL OUTER JOIN} -- obsługuje przypadki gdy tabela istniała tylko w jednym pomiarze
+		\item \textbf{ISNULL} -- zabezpieczenie przed NULL przy obliczaniu przyrostu
+		\item \textbf{ROW\_NUMBER()} -- wybór tabeli z największym przyrostem w każdej bazie
+	\end{itemize}
+	
+	\subsubsection{Przykład użycia}
+	
+	\begin{lstlisting}[language=SQL]
+-- Porównanie pomiarów przed i po dodaniu rekordów
+EXEC dbo.pr_pm_stats @check_id_1=5, @check_id_2=8;
+	\end{lstlisting}
+	
+	\subsubsection{Przykładowe wyniki}
+	
+	\textbf{Wynik 1 -- Szczegółowe przyrosty dla wszystkich tabel:}
+	\begin{lstlisting}
+baza    tabela         check_1  check_2  przyrost
+------  -------------  -------  -------  --------
+PM_DB3  [dbo].[ETATY]  4        7        3
+PM_DB3  [dbo].[MIASTA] 4        4        0
+PM_DB3  [dbo].[OSOBY]  5        7        2
+PM_DB3  [dbo].[WOJ]    3        3        0
+	\end{lstlisting}
+	
+	\textbf{Wynik 2 -- Największy przyrost w każdej bazie:}
+	\begin{lstlisting}
+baza    najwiekszy_przyrost_w_bazie_pomiedzy_check1_i_check2
+------  -----------------------------------------------------
+PM_DB3  [dbo].[ETATY]
+	\end{lstlisting}
+	
+	Wyniki pokazują, że w bazie \texttt{PM\_DB3} największy przyrost (+3) wystąpił w tabeli \texttt{ETATY}.
+	
+	\subsection{4.5.1 -- Statystyki miesięczne}
+	
+	Procedura \texttt{ST\_M\_PM331720} wykorzystuje procedurę \texttt{pr\_pm\_stats} do analizy przyrostów w danym miesiącu:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.ST_M_PM331720
+@parametr_ym NCHAR(6),  -- format: YYYYMM np. '202510'
+@baza NVARCHAR(100)
+AS
+BEGIN
+SET NOCOUNT ON;
+		
+-- Wyszukanie najwcześniejszego pomiaru w miesiącu
+DECLARE @c1 INT = (
+SELECT MIN(check_id) FROM dbo.DB_CHECK 
+WHERE CONVERT(NCHAR(6), d_stamp, 112) = @parametr_ym 
+AND db_nam = @baza
+);
+		
+-- Wyszukanie najpóźniejszego pomiaru w miesiącu
+DECLARE @c2 INT = (
+SELECT MAX(check_id) FROM dbo.DB_CHECK 
+WHERE CONVERT(NCHAR(6), d_stamp, 112) = @parametr_ym 
+AND db_nam = @baza
+);
+		
+-- Walidacja
+IF @c1 IS NULL OR @c2 IS NULL
+BEGIN
+RAISERROR(N'Brak pomiarów dla wskazanego miesiąca i bazy.', 16, 6);
+RETURN;
+END
+		
+-- Wywołanie procedury porównawczej
+EXEC dbo.pr_pm_stats @check_id_1 = @c1, @check_id_2 = @c2;
+END
+	\end{lstlisting}
+	
+	\textbf{Format daty:} \texttt{CONVERT(NCHAR(6), d\_stamp, 112)} zwraca YYYYMM (np. 202510 dla października 2025)
+	
+	\subsubsection{Przykład użycia}
+	
+	\begin{lstlisting}[language=SQL]
+-- Przyrosty w październiku 2025 dla PM_DB3
+EXEC dbo.ST_M_PM331720 @parametr_ym=N'202510', @baza=N'PM_DB3';
+	\end{lstlisting}
+	
+	\subsection{4.5.2 -- Statystyki dzienne}
+	
+	Analogiczna implementacja dla statystyk dziennych:
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.ST_D_PM331720
+@parametr_dzien NCHAR(8),  -- format: YYYYMMDD np. '20251027'
+@baza NVARCHAR(100)
+AS
+BEGIN
+SET NOCOUNT ON;
+		
+-- Najwcześniejszy pomiar w dniu
+DECLARE @c1 INT = (
+SELECT MIN(check_id) FROM dbo.DB_CHECK 
+WHERE CONVERT(NCHAR(8), d_stamp, 112) = @parametr_dzien 
+AND db_nam = @baza
+);
+		
+-- Najpóźniejszy pomiar w dniu
+DECLARE @c2 INT = (
+SELECT MAX(check_id) FROM dbo.DB_CHECK 
+WHERE CONVERT(NCHAR(8), d_stamp, 112) = @parametr_dzien 
+AND db_nam = @baza
+);
+		
+-- Walidacja
+IF @c1 IS NULL OR @c2 IS NULL
+BEGIN
+RAISERROR(N'Brak pomiarów dla wskazanego dnia i bazy.', 16, 7);
+RETURN;
+END
+		
+-- Wywołanie procedury porównawczej
+EXEC dbo.pr_pm_stats @check_id_1 = @c1, @check_id_2 = @c2;
+END
+	\end{lstlisting}
+	
+	\textbf{Format daty:} \texttt{CONVERT(NCHAR(8), d\_stamp, 112)} zwraca YYYYMMDD (np. 20251027)
+	
+	\subsubsection{Przykład użycia}
+	
+	\begin{lstlisting}[language=SQL]
+-- Przyrosty w dniu 27 października 2025 dla PM_DB3
+EXEC dbo.ST_D_PM331720 @parametr_dzien=N'20251027', @baza=N'PM_DB3';
+	\end{lstlisting}
+	
+	\section{Dodatkowe elementy implementacji}
+	
+	\subsection{Backup bazy administracyjnej}
+	
+	Automatyczny backup z timestampem w nazwie pliku:
+	
+	\begin{lstlisting}[language=SQL]
+DECLARE @bakfile NVARCHAR(260) = 
+N'D:\stud\sem 5\AdminBazDa\2\B25_ADM_PM331720_backup_' + 
+REPLACE(CONVERT(NVARCHAR(20), GETDATE(), 120), ':', '-') + N'.bak';
+		
+BACKUP DATABASE [B25_ADM_PM331720]
+TO DISK = @bakfile
+WITH INIT, FORMAT, 
+NAME = N'Full backup B25_ADM_PM331720 - PM331720';
+	\end{lstlisting}
+	
+	Nazwa pliku np: \texttt{B25\_ADM\_PM331720\_backup\_2025-10-27 22-30-15.bak}
+	
+	\subsection{Utworzenie dedykowanego użytkownika}
+	
+	\begin{lstlisting}[language=SQL]
+-- Login na poziomie serwera
+CREATE LOGIN pm_331720_login WITH PASSWORD = N'Pm331720@2025';
+		
+- Użytkownik w bazie administracyjnej
+USE B25_ADM_PM331720;
+CREATE USER pm_331720_user FOR LOGIN pm_331720_login;
+		
+-- Uprawnienia: odczyt i zapis
+ALTER ROLE db_datareader ADD MEMBER pm_331720_user;
+ALTER ROLE db_datawriter ADD MEMBER pm_331720_user;
+	\end{lstlisting}
+	
+	\section{Scenariusz testowy}
+	
+	\subsection{Krok 1: Pierwszy snapshot}
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.pr_pm_check_all @opis=N'Snapshot początkowy';
+	\end{lstlisting}
+	
+	Stan przed dodaniem rekordów:
+	\begin{itemize}
+		\item PM\_DB1: OSOBY=5, ETATY=4
+		\item PM\_DB2: OSOBY=5, ETATY=4
+		\item PM\_DB3: OSOBY=5, ETATY=4
+	\end{itemize}
+	
+	\subsection{Krok 2: Dodanie rekordów w PM\_DB3}
+	\begin{lstlisting}[language=SQL]
+USE PM_DB3;
+INSERT INTO dbo.OSOBY VALUES (...); -- +2 osoby
+INSERT INTO dbo.ETATY VALUES (...); -- +3 etaty
+	\end{lstlisting}
+	
+	\subsection{Krok 3: Drugi snapshot}
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.pr_pm_check_all @opis=N'Po dodaniu rekordów';
+	\end{lstlisting}
+	
+	Stan po dodaniu:
+	\begin{itemize}
+		\item PM\_DB1: OSOBY=5, ETATY=4 (bez zmian)
+		\item PM\_DB2: OSOBY=5, ETATY=4 (bez zmian)
+		\item PM\_DB3: OSOBY=7, ETATY=7 (przyrost!)
+	\end{itemize}
+	
+	\subsection{Krok 4: Analiza przyrostów}
+	\begin{lstlisting}[language=SQL]
+-- Porównanie check_id=5 i check_id=8
+EXEC dbo.pr_pm_stats @check_id_1=5, @check_id_2=8;
+-- Historia tabeli OSOBY w PM_DB3
+EXEC dbo.pr_pm_history @db='PM_DB3', @table='OSOBY';
+-- Statystyki miesięczne
+EXEC dbo.ST_M_PM331720 @parametr_ym=N'202510', @baza=N'PM_DB3';
+	\end{lstlisting}
+	
+	\section{Podsumowanie}
+	
+	W ramach laboratorium zrealizowano kompleksowy system monitorowania liczby rekordów:
+
+	\vspace{1cm}
+	
+	\begin{center}
+		\textit{Paweł Myszka, nr albumu 331720}\\
+		\textit{27 października 2025}
+	\end{center}
+	
+\end{document}
