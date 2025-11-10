@@ -1,0 +1,579 @@
+/* 
+   Autor: Pawel Myszka
+   Nr indeksu: 331720
+   Dzień zajęć: Piatek
+   Data: 2025-10-05
+*/
+
+USE b25_adm
+GO
+
+/* 
+================================================================================
+   ZADANIE Z1 - Procedura tworzenia baz i adminów
+================================================================================
+   Procedura bez parametrów, która:
+   1. Pobiera zlecenia z tabeli ZLECENIE gdzie tb_id IS NULL (niezrealizowane)
+   2. Tworzy bazy danych (jeśli nie istnieją)
+   3. Tworzy adminów w tych bazach (jeśli nie istnieją)
+   4. Zapisuje wyniki w tabeli TWORZ_BAZE
+*/
+
+IF EXISTS (SELECT 1 FROM b25_adm.sys.objects WHERE object_id = OBJECT_ID(N'dbo.z1_b25_tb') AND type = 'P')
+    DROP PROCEDURE dbo.z1_b25_tb
+GO
+
+CREATE PROCEDURE dbo.z1_b25_tb
+AS
+BEGIN
+    SET NOCOUNT ON; -- wyłącza komunikaty "X rows affected"
+    
+    /* Zmienne lokalne */
+    DECLARE @db nvarchar(60)              -- nazwa bazy danych
+    DECLARE @u nvarchar(60)               -- nazwa użytkownika (admina)
+    DECLARE @prefix nvarchar(20)          -- prefix dla nazw baz
+    DECLARE @wz nvarchar(20)              -- wzorzec do sprawdzania prefixu
+    DECLARE @sql nvarchar(1000)           -- zmienna do przechowania dynamicznego SQL
+    DECLARE @db_already_exists bit        -- flaga: czy baza już istnieje
+    DECLARE @adm_already_exists bit       -- flaga: czy admin już istnieje
+    DECLARE @czynnosc_id int              -- ID czynności w tabeli CZYNNOSC
+    DECLARE @zlecenie_id int              -- ID zlecenia
+    DECLARE @tb_id int                    -- ID z tabeli TWORZ_BAZE
+    DECLARE @err_msg nvarchar(250)        -- komunikat błędu
+    
+    /* Ustawienie prefixu dla nazw baz */
+    SET @prefix = N'b25'
+    SET @wz = @prefix + N'%' -- wzorzec: b25%
+    
+    /* Rejestrujemy rozpoczęcie procesu w tabeli CZYNNOSC */
+    INSERT INTO b25_adm.dbo.CZYNNOSC (rodzaj) 
+    VALUES (N'Realizacja zlecenia na tworzenie baz i adminow')
+    SET @czynnosc_id = SCOPE_IDENTITY() -- pobieramy ID nowo wstawionego rekordu
+    
+    /* Deklaracja kursora - pobiera wszystkie niezrealizowane zlecenia */
+    DECLARE CC INSENSITIVE CURSOR FOR 
+        SELECT z.[db_name], z.[usr_name], z.zlecenie_id
+        FROM b25_adm..ZLECENIE z 
+        WHERE z.tb_id IS NULL -- tylko niezrealizowane zlecenia
+    
+    /* Otwieramy kursor */
+    OPEN CC
+    
+    /* Pobieramy pierwszy wiersz */
+    FETCH NEXT FROM CC INTO @db, @u, @zlecenie_id
+    
+    /* Pętla główna - iterujemy po wszystkich zleceniach */
+    WHILE @@FETCH_STATUS = 0 -- @@FETCH_STATUS = 0 oznacza sukces
+    BEGIN
+        /* Resetujemy flagi dla każdego zlecenia */
+        SET @db_already_exists = 0
+        SET @adm_already_exists = 0
+        SET @err_msg = NULL
+        
+        /* Dodajemy prefix do nazwy bazy, jeśli go nie ma */
+        IF @db NOT LIKE @wz
+        BEGIN
+            SET @db = @prefix + N'_' + @db
+        END
+        
+        /* Dodajemy prefix do nazwy użytkownika, jeśli go nie ma */
+        IF @u NOT LIKE @wz
+        BEGIN
+            SET @u = @prefix + N'_' + @u
+        END
+        
+        /* Dodajemy postfix '_adm' do nazwy użytkownika, jeśli go nie ma */
+        IF @u NOT LIKE '%_adm'
+        BEGIN
+            SET @u = @u + N'_adm'
+        END
+        
+        /* Komunikat informacyjny */
+        PRINT N'Przetwarzam: baza=' + @db + N', admin=' + @u
+        
+        /* KROK 1: Sprawdzamy czy baza już istnieje */
+        IF EXISTS (SELECT 1 FROM master..sysdatabases d WHERE d.[name] = @db)
+        BEGIN
+            SET @db_already_exists = 1
+            SET @err_msg = N'Baza ' + @db + N' juz istnieje'
+            PRINT @err_msg
+            
+            /* Sprawdzamy czy admin już istnieje w tej bazie */
+            SET @sql = N'USE [' + @db + N'];' +
+                       N'IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + @u + N''') ' +
+                       N'SET @exists = 1 ELSE SET @exists = 0'
+            
+            EXEC sp_executesql @sql, N'@exists bit OUTPUT', @exists = @adm_already_exists OUTPUT
+            
+            IF @adm_already_exists = 1
+            BEGIN
+                SET @err_msg = @err_msg + N', Admin ' + @u + N' juz istnieje w bazie'
+                PRINT N'Admin ' + @u + N' juz istnieje w bazie ' + @db
+            END
+        END
+        ELSE
+        BEGIN
+            /* KROK 2: Tworzymy bazę danych (jeśli nie istnieje) */
+            BEGIN TRY
+                SET @sql = N'CREATE DATABASE [' + @db + N']'
+                EXEC sp_executesql @sql
+                PRINT N'Utworzono baze: ' + @db
+            END TRY
+            BEGIN CATCH
+                SET @err_msg = N'Blad tworzenia bazy: ' + ERROR_MESSAGE()
+                PRINT @err_msg
+            END CATCH
+        END
+        
+        /* KROK 3: Dodajemy admina (jeśli nie istnieje) */
+        IF @adm_already_exists = 0
+        BEGIN
+            BEGIN TRY
+                /* Sprawdzamy czy login (konto systemowe) już istnieje */
+                IF NOT EXISTS (SELECT 1 FROM master.sys.server_principals WHERE name = @u)
+                BEGIN
+                    /* Tworzymy login systemowy */
+                    EXEC sp_addlogin @loginame = @u, @passwd = @u, @defdb = @db
+                    PRINT N'Utworzono login: ' + @u
+                END
+                
+                /* Dodajemy użytkownika do bazy */
+                SET @sql = N'USE [' + @db + N'];' +
+                           N'IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + @u + N''') ' +
+                           N'EXEC sp_adduser @loginame = ''' + @u + N''''
+                EXEC sp_executesql @sql
+                PRINT N'Dodano uzytkownika ' + @u + N' do bazy ' + @db
+                
+                /* Nadajemy uprawnienia db_owner (pełne uprawnienia w bazie) */
+                SET @sql = N'USE [' + @db + N'];' +
+                           N'EXEC sp_addrolemember @rolename = ''db_owner'', @membername = ''' + @u + N''''
+                EXEC sp_executesql @sql
+                PRINT N'Nadano uprawnienia db_owner dla ' + @u
+                
+            END TRY
+            BEGIN CATCH
+                SET @err_msg = ISNULL(@err_msg + N'; ', N'') + N'Blad tworzenia admina: ' + ERROR_MESSAGE()
+                PRINT @err_msg
+            END CATCH
+        END
+        
+        /* KROK 4: Zapisujemy wynik w tabeli TWORZ_BAZE */
+        INSERT INTO B25_ADM..TWORZ_BAZE 
+        (   [nazwa]
+        ,   [admin]
+        ,   czynnosc_id
+        ,   db_already_exists
+        ,   adm_already_exists
+        ,   err_msg
+        ) 
+        VALUES
+        (   @db
+        ,   @u
+        ,   @czynnosc_id
+        ,   @db_already_exists
+        ,   @adm_already_exists
+        ,   @err_msg
+        )
+        
+        /* Pobieramy ID nowo wstawionego rekordu */
+        SET @tb_id = SCOPE_IDENTITY()
+        
+        /* Aktualizujemy zlecenie - łączymy je z rekordem TWORZ_BAZE */
+        UPDATE B25_ADM..ZLECENIE 
+        SET tb_id = @tb_id 
+        WHERE zlecenie_id = @zlecenie_id
+        
+        /* Pobieramy następne zlecenie */
+        FETCH NEXT FROM CC INTO @db, @u, @zlecenie_id
+    END
+    
+    /* Zamykamy i zwalniamy kursor */
+    CLOSE CC
+    DEALLOCATE CC
+    
+    PRINT N'Zakonczono przetwarzanie zlecen'
+END
+GO
+
+/* Test procedury Z1 */
+PRINT N'========================================='
+PRINT N'TEST ZADANIA Z1'
+PRINT N'========================================='
+EXEC dbo.z1_b25_tb
+GO
+
+/* Sprawdzamy wyniki */
+SELECT N'Utworzone bazy:' AS Info
+SELECT * FROM b25_adm..TWORZ_BAZE ORDER BY tb_id DESC
+GO
+
+SELECT N'Zlecenia po realizacji:' AS Info
+SELECT * FROM b25_adm..ZLECENIE ORDER BY zlecenie_id
+GO
+
+/* 
+================================================================================
+   ZADANIE Z1.2 - Procedura raportująca
+================================================================================
+   Procedura z parametrem @ym (rok-miesiąc w formacie YYYYMM), która zwraca:
+   1. Listę czynności wykonanych w danym miesiącu
+   2. Zlecenia zadane w danym miesiącu i jak zostały wykonane
+   3. Zlecenia oczekujące na wykonanie (tb_id IS NULL)
+   4. Zlecenia z błędami (db_already_exists=1 lub adm_already_exists=1)
+*/
+
+IF EXISTS (SELECT 1 FROM b25_adm.sys.objects WHERE object_id = OBJECT_ID(N'dbo.z1_2_b25_tb_raport') AND type = 'P')
+    DROP PROCEDURE dbo.z1_2_b25_tb_raport
+GO
+
+CREATE PROCEDURE dbo.z1_2_b25_tb_raport
+    @ym nchar(6) -- parametr: rok-miesiąc w formacie YYYYMM, np. '202510'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    /* Walidacja parametru */
+    IF @ym IS NULL OR LEN(@ym) <> 6
+    BEGIN
+        PRINT N'BLAD: Parametr @ym musi byc w formacie YYYYMM (np. 202510)'
+        RETURN
+    END
+    
+    PRINT N'========================================='
+    PRINT N'RAPORT DLA MIESIACA: ' + @ym
+    PRINT N'========================================='
+    PRINT N''
+    
+    /* RAPORT 1: Czynności wykonane w danym miesiącu */
+    PRINT N'1. CZYNNOSCI WYKONANE W MIESIACU ' + @ym + N':'
+    PRINT N'-----------------------------------------'
+    
+    SELECT 
+        c.czynnosc_id AS [ID Czynnosci],
+        c.start AS [Data rozpoczecia],
+        c.kto AS [Kto wykonal (system)],
+        c.kto_db AS [Kto wykonal (baza)],
+        c.rodzaj AS [Rodzaj czynnosci],
+        COUNT(tb.tb_id) AS [Liczba baz utworzonych]
+    FROM b25_adm..CZYNNOSC c
+    LEFT JOIN b25_adm..TWORZ_BAZE tb ON tb.czynnosc_id = c.czynnosc_id
+    WHERE CONVERT(nchar(6), c.start, 112) = @ym -- konwersja daty do formatu YYYYMM
+    GROUP BY c.czynnosc_id, c.start, c.kto, c.kto_db, c.rodzaj
+    ORDER BY c.start DESC
+    
+    PRINT N''
+    
+    /* RAPORT 2: Zlecenia zadane w danym miesiącu */
+    PRINT N'2. ZLECENIA ZADANE W MIESIACU ' + @ym + N':'
+    PRINT N'-----------------------------------------'
+    
+    SELECT 
+        z.zlecenie_id AS [ID Zlecenia],
+        z.[db_name] AS [Nazwa bazy],
+        z.[usr_name] AS [Nazwa usera],
+        z.data_wpisania_zlecenia AS [Data zlecenia],
+        CASE 
+            WHEN z.tb_id IS NULL THEN N'OCZEKUJE'
+            ELSE N'ZREALIZOWANE'
+        END AS [Status],
+        tb.dStamp AS [Data realizacji],
+        CASE 
+            WHEN tb.db_already_exists = 1 THEN N'Baza juz istniala'
+            ELSE N'Baza utworzona'
+        END AS [Status bazy],
+        CASE 
+            WHEN tb.adm_already_exists = 1 THEN N'Admin juz istnial'
+            ELSE N'Admin utworzony'
+        END AS [Status admina],
+        tb.err_msg AS [Komunikat bledu]
+    FROM b25_adm..ZLECENIE z
+    LEFT JOIN b25_adm..TWORZ_BAZE tb ON tb.tb_id = z.tb_id
+    WHERE CONVERT(nchar(6), z.data_wpisania_zlecenia, 112) = @ym
+    ORDER BY z.data_wpisania_zlecenia DESC
+    
+    PRINT N''
+    
+    /* RAPORT 3: Zlecenia oczekujące na wykonanie */
+    PRINT N'3. ZLECENIA OCZEKUJACE NA WYKONANIE:'
+    PRINT N'-----------------------------------------'
+    
+    SELECT 
+        z.zlecenie_id AS [ID Zlecenia],
+        z.[db_name] AS [Nazwa bazy],
+        z.[usr_name] AS [Nazwa usera],
+        z.data_wpisania_zlecenia AS [Data zlecenia],
+        DATEDIFF(day, z.data_wpisania_zlecenia, GETDATE()) AS [Dni oczekiwania]
+    FROM b25_adm..ZLECENIE z
+    WHERE z.tb_id IS NULL
+    ORDER BY z.data_wpisania_zlecenia
+    
+    PRINT N''
+    
+    /* RAPORT 4: Zlecenia z błędami */
+    PRINT N'4. ZLECENIA Z BLEDAMI (baza lub admin juz istnial):'
+    PRINT N'-----------------------------------------'
+    
+    SELECT 
+        z.zlecenie_id AS [ID Zlecenia],
+        z.[db_name] AS [Nazwa bazy],
+        z.[usr_name] AS [Nazwa usera],
+        tb.nazwa AS [Utworzona nazwa bazy],
+        tb.[admin] AS [Utworzona nazwa admina],
+        CASE 
+            WHEN tb.db_already_exists = 1 THEN N'TAK'
+            ELSE N'NIE'
+        END AS [Baza istniala],
+        CASE 
+            WHEN tb.adm_already_exists = 1 THEN N'TAK'
+            ELSE N'NIE'
+        END AS [Admin istnial],
+        tb.err_msg AS [Komunikat bledu],
+        tb.dStamp AS [Data przetworzenia]
+    FROM b25_adm..ZLECENIE z
+    INNER JOIN b25_adm..TWORZ_BAZE tb ON tb.tb_id = z.tb_id
+    WHERE tb.db_already_exists = 1 OR tb.adm_already_exists = 1 OR tb.err_msg IS NOT NULL
+    ORDER BY tb.dStamp DESC
+    
+    PRINT N''
+    PRINT N'========================================='
+    PRINT N'KONIEC RAPORTU'
+    PRINT N'========================================='
+END
+GO
+
+/* Test procedury Z1.2 */
+PRINT N'========================================='
+PRINT N'TEST ZADANIA Z1.2'
+PRINT N'========================================='
+EXEC dbo.z1_2_b25_tb_raport @ym = N'202510'
+GO
+
+/* 
+================================================================================
+   ZADANIE Z1.3 - Procedura usuwająca bazy z danym prefixem
+================================================================================
+   Procedura z parametrem @prefix, która:
+   1. Sprawdza czy prefix ma minimum 2 znaki
+   2. Kursorem wyszukuje bazy do skasowania (pomijając b25_adm)
+   3. Dla każdej bazy usuwa admina i bazę
+*/
+
+IF EXISTS (SELECT 1 FROM b25_adm.sys.objects WHERE object_id = OBJECT_ID(N'dbo.z1_3_usun_bazy') AND type = 'P')
+    DROP PROCEDURE dbo.z1_3_usun_bazy
+GO
+
+CREATE PROCEDURE dbo.z1_3_usun_bazy
+    @prefix nvarchar(20) -- prefix baz do usunięcia, np. 'b25'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    /* Zmienne lokalne */
+    DECLARE @db nvarchar(100)          -- nazwa bazy do usunięcia
+    DECLARE @tb_id int                 -- ID z tabeli TWORZ_BAZE
+    DECLARE @admin nvarchar(100)       -- nazwa admina do usunięcia
+    DECLARE @sql nvarchar(1000)        -- dynamiczny SQL
+    DECLARE @wzorzec nvarchar(25)      -- wzorzec do szukania baz
+    DECLARE @czynnosc_id int           -- ID czynności
+    DECLARE @count int                 -- licznik usuniętych baz
+    
+    /* KROK 1: Walidacja parametru */
+    IF @prefix IS NULL OR LEN(@prefix) < 2
+    BEGIN
+        PRINT N'BLAD: Parametr @prefix musi miec minimum 2 znaki'
+        RETURN
+    END
+    
+    /* Dodajemy % na końcu, jeśli nie ma */
+    IF RIGHT(@prefix, 1) <> N'%'
+        SET @wzorzec = @prefix + N'%'
+    ELSE
+        SET @wzorzec = @prefix
+    
+    PRINT N'========================================='
+    PRINT N'USUWANIE BAZ Z PREFIXEM: ' + @prefix
+    PRINT N'========================================='
+    PRINT N''
+    
+    /* Rejestrujemy czynność */
+    INSERT INTO b25_adm.dbo.CZYNNOSC (rodzaj) 
+    VALUES (N'Usuwanie baz z prefixem: ' + @prefix)
+    SET @czynnosc_id = SCOPE_IDENTITY()
+    
+    SET @count = 0
+    
+    /* KROK 2: Deklaracja kursora - pobiera bazy do usunięcia */
+    DECLARE CC INSENSITIVE CURSOR FOR 
+        SELECT d.[name] 
+        FROM master..sysdatabases d
+        WHERE d.name NOT IN (N'master', N'tempdb', N'model', N'msdb', N'B25_ADM', N'b25_adm')
+        AND d.name LIKE @wzorzec
+        ORDER BY d.[name]
+    
+    OPEN CC
+    FETCH NEXT FROM CC INTO @db
+    
+    /* KROK 3: Pętla usuwająca bazy */
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        PRINT N'Przetwarzam baze: ' + @db
+        
+        /* Inicjalizacja zmiennych */
+        SET @tb_id = NULL
+        SET @admin = NULL
+        
+        /* Szukamy ostatniego wpisu dla tej bazy w TWORZ_BAZE */
+        SELECT @tb_id = MAX(tb.tb_id)
+        FROM b25_adm..TWORZ_BAZE tb
+        WHERE tb.[nazwa] = @db
+        
+        /* Jeśli znaleźliśmy wpis, pobieramy nazwę admina */
+        IF @tb_id IS NOT NULL
+        BEGIN
+            SELECT @admin = tb.[admin] 
+            FROM b25_adm..TWORZ_BAZE tb 
+            WHERE tb.tb_id = @tb_id
+            
+            PRINT N'  Znaleziono admina: ' + ISNULL(@admin, N'BRAK')
+        END
+        ELSE
+        BEGIN
+            PRINT N'  Nie znaleziono wpisu w TWORZ_BAZE dla bazy ' + @db
+        END
+        
+        /* KROK 3a: Usuwamy admina (jeśli istnieje) */
+        IF @admin IS NOT NULL
+        BEGIN
+            BEGIN TRY
+                /* Najpierw usuwamy użytkownika z bazy */
+                SET @sql = N'USE [' + @db + N'];' +
+                           N'IF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = ''' + @admin + N''') ' +
+                           N'DROP USER [' + @admin + N']'
+                EXEC sp_executesql @sql
+                PRINT N'  Usunieto uzytkownika ' + @admin + N' z bazy ' + @db
+                
+                /* Sprawdzamy czy login systemowy jest używany w innych bazach */
+                DECLARE @login_in_use bit
+                SET @login_in_use = 0
+                
+                SET @sql = N'SELECT @used = COUNT(*) FROM sys.database_principals dp ' +
+                           N'INNER JOIN sys.server_principals sp ON dp.sid = sp.sid ' +
+                           N'WHERE sp.name = ''' + @admin + N''''
+                
+                EXEC sp_executesql @sql, N'@used int OUTPUT', @used = @login_in_use OUTPUT
+                
+                /* Jeśli login nie jest używany nigdzie indziej, usuwamy go */
+                IF @login_in_use = 0
+                BEGIN
+                    IF EXISTS (SELECT 1 FROM master.sys.server_principals WHERE name = @admin)
+                    BEGIN
+                        EXEC sp_droplogin @loginame = @admin
+                        PRINT N'  Usunieto login systemowy: ' + @admin
+                    END
+                END
+                ELSE
+                BEGIN
+                    PRINT N'  Login ' + @admin + N' jest uywany w innych bazach - nie usuwam'
+                END
+                
+            END TRY
+            BEGIN CATCH
+                PRINT N'  BLAD przy usuwaniu admina ' + @admin + N': ' + ERROR_MESSAGE()
+            END CATCH
+        END
+        
+        /* KROK 3b: Usuwamy bazę */
+        BEGIN TRY
+            /* Najpierw ustawiamy bazę w tryb SINGLE_USER, aby rozłączyć wszystkie połączenia */
+            SET @sql = N'ALTER DATABASE [' + @db + N'] SET SINGLE_USER WITH ROLLBACK IMMEDIATE'
+            EXEC sp_executesql @sql
+            
+            /* Usuwamy bazę */
+            SET @sql = N'DROP DATABASE [' + @db + N']'
+            EXEC sp_executesql @sql
+            
+            PRINT N'  Usunieto baze: ' + @db
+            SET @count = @count + 1
+            
+        END TRY
+        BEGIN CATCH
+            PRINT N'  BLAD przy usuwaniu bazy ' + @db + N': ' + ERROR_MESSAGE()
+        END CATCH
+        
+        PRINT N''
+        
+        /* Pobieramy następną bazę */
+        FETCH NEXT FROM CC INTO @db
+    END
+    
+    /* Zamykamy kursor */
+    CLOSE CC
+    DEALLOCATE CC
+    
+    PRINT N'========================================='
+    PRINT N'Usunieto ' + CAST(@count AS nvarchar(10)) + N' baz'
+    PRINT N'========================================='
+END
+GO
+
+/* 
+UWAGA: Test Z1.3 jest zakomentowany, ponieważ usuwa bazy!
+Odkomentuj tylko jeśli jesteś pewien, że chcesz usunąć bazy testowe.
+
+PRINT N'========================================='
+PRINT N'TEST ZADANIA Z1.3 (UWAGA: USUWA BAZY!)'
+PRINT N'========================================='
+
+-- Listujemy bazy przed usunięciem
+SELECT N'Bazy przed usunieciem:' AS Info
+SELECT name FROM master..sysdatabases 
+WHERE name LIKE N'b25%' AND name <> N'b25_adm'
+ORDER BY name
+GO
+
+-- Wywołanie procedury usuwającej
+EXEC b25_adm.dbo.z1_3_usun_bazy @prefix = N'b25'
+GO
+
+-- Listujemy bazy po usunięciu
+SELECT N'Bazy po usunieciu:' AS Info
+SELECT name FROM master..sysdatabases 
+WHERE name LIKE N'b25%' AND name <> N'b25_adm'
+ORDER BY name
+GO
+*/
+
+/* 
+================================================================================
+   DODATKOWE ZAPYTANIA DO SPRAWOZDANIA
+================================================================================
+*/
+
+PRINT N''
+PRINT N'========================================='
+PRINT N'PODSUMOWANIE WSZYSTKICH TABEL'
+PRINT N'========================================='
+
+-- Tabela CZYNNOSC
+SELECT N'Tabela CZYNNOSC:' AS Info
+SELECT * FROM b25_adm..CZYNNOSC ORDER BY czynnosc_id DESC
+GO
+
+-- Tabela ZLECENIE
+SELECT N'Tabela ZLECENIE:' AS Info
+SELECT * FROM b25_adm..ZLECENIE ORDER BY zlecenie_id
+GO
+
+-- Tabela TWORZ_BAZE
+SELECT N'Tabela TWORZ_BAZE:' AS Info
+SELECT * FROM b25_adm..TWORZ_BAZE ORDER BY tb_id DESC
+GO
+
+-- Lista wszystkich baz z prefixem b25
+SELECT N'Lista baz z prefixem b25:' AS Info
+SELECT name AS [Nazwa bazy], crdate AS [Data utworzenia]
+FROM master..sysdatabases 
+WHERE name LIKE N'b25%'
+ORDER BY name
+GO
+
