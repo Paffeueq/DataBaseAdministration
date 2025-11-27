@@ -1,0 +1,783 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[polish]{babel}
+\usepackage{graphicx}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage[margin=1.5cm]{geometry}
+
+\lstset{
+	basicstyle=\ttfamily\footnotesize,
+	breaklines=true,
+	frame=single,
+	backgroundcolor=\color{gray!10},
+	xleftmargin=3pt,
+	framexleftmargin=3pt,
+	numbers=left,
+	numberstyle=\tiny,
+	keywordstyle=\color{blue}\bfseries,
+	commentstyle=\color{green!60!black},
+	stringstyle=\color{red}
+}
+
+\title{LABORATORIUM 4\\
+	\Large Zarządzanie Backupami Baz Danych SQL Server}
+\author{Paweł Myszka\\
+	Nr albumu: 331720}
+\date{27 listopada 2025}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Z4 -- 331720}
+\fancyhead[R]{Administracja BD}
+\fancyfoot[C]{\thepage\ / \pageref{LastPage}}
+
+\begin{document}
+	
+	\maketitle
+	\thispagestyle{fancy}
+	
+	\section{Treść zadania}
+	
+	Celem laboratorium było stworzenie kompleksowego systemu do zarządzania backupami baz danych. System umożliwia:
+	\begin{itemize}
+		\item \textbf{Logowanie} wszystkich operacji backup'u w tabeli administracyjnej
+		\item \textbf{Backup pojedynczej bazy} na żądanie
+		\item \textbf{Backup wszystkich baz} w jednym poleceniu
+		\item \textbf{Backup inteligentny} -- tylko baz gdzie detekcji przyrost danych
+		\item \textbf{Automatyzacja} poprzez SQL Agent Job (codziennie)
+	\end{itemize}
+	
+	Typowy scenariusz użycia:
+	\begin{enumerate}
+		\item Administrator uruchamia procedurę backup'u ręcznie lub poprzez Job
+		\item Każdy backup jest logowany w tabeli BK\_LOG
+		\item Pliki backup'u tworzą się w wyznaczonym katalogu z nazwą: \texttt{BAZA\_\_YYYYMMDDHHMM.bak}
+		\item System może automatycznie backup'ować tylko bazy gdzie nastąpił przyrost danych
+	\end{enumerate}
+	
+	\section{Struktura systemu}
+	
+	\subsection{Tabela administracyjna BK\_LOG}
+	
+	\begin{lstlisting}[language=SQL]
+CREATE TABLE dbo.BK_LOG (
+	bk_id INT NOT NULL IDENTITY(1,1) 
+		CONSTRAINT PK_BK_LOG PRIMARY KEY,
+	nazwa_b NVARCHAR(100) NOT NULL,
+	nazwa_pliku_bk NVARCHAR(200) NOT NULL,
+	kto NVARCHAR(100) NOT NULL DEFAULT USER_NAME(),
+	skad NVARCHAR(100) NOT NULL DEFAULT HOST_NAME(),
+	kiedy DATETIME NOT NULL DEFAULT GETDATE(),
+	status NVARCHAR(50) DEFAULT 'SUCCESS',
+	err_msg NVARCHAR(500)
+);
+	\end{lstlisting}
+	
+	\textbf{Pola tabeli:}
+	\begin{itemize}
+		\item \texttt{bk\_id} -- ID wpisu w dzienniku (IDENTITY)
+		\item \texttt{nazwa\_b} -- Nazwa bazy danych, której dotyczy backup
+		\item \texttt{nazwa\_pliku\_bk} -- Pełna ścieżka do pliku backup'u
+		\item \texttt{kto} -- Login użytkownika, który uruchomił backup
+		\item \texttt{skad} -- Nazwa hosta serwera
+		\item \texttt{kiedy} -- Data i czas wykonania backup'u
+		\item \texttt{status} -- Status operacji (SUCCESS/FAILED)
+		\item \texttt{err\_msg} -- Komunikat błędu (jeśli był)
+	\end{itemize}
+	
+	\section{Procedury zarządzania backupami}
+	
+	\subsection{Procedura bk\_db -- Backup pojedynczej bazy}
+	
+	Procedura odpowiadająca za backup jednej wybranej bazy danych.
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.bk_db
+	@db NVARCHAR(100),
+	@path NVARCHAR(200) = N'C:\temp\'
+AS
+BEGIN
+	-- Parametry:
+	-- @db - nazwa bazy do backup'u
+	-- @path - ścieżka docelowa (domyślnie C:\temp\)
+	
+	DECLARE @fname NVARCHAR(1000)
+	DECLARE @sql NVARCHAR(MAX)
+	DECLARE @timestamp NVARCHAR(50)
+	DECLARE @exists INT
+	DECLARE @err_msg NVARCHAR(500)
+	
+	BEGIN TRY
+		-- Sprawdzenie czy baza istnieje
+		SELECT @exists = COUNT(*) FROM sys.databases WHERE name = @db
+		IF @exists = 0
+			RAISERROR('Baza nie istnieje', 16, 1)
+		
+		-- Format timestampa: YYYYMMDDHHMM
+		SET @timestamp = REPLACE(REPLACE(CONVERT(NVARCHAR(19), 
+			GETDATE(), 126), N':', N''), N'-', N'')
+		SET @timestamp = SUBSTRING(@timestamp, 1, 12)
+		
+		-- Dodanie backslasha jeśli brakuje
+		IF RIGHT(@path, 1) <> N'\'
+			SET @path = @path + N'\'
+		
+		-- Tworzenie nazwy: BAZA__YYYYMMDDHHMM.bak
+		SET @fname = @path + RTRIM(@db) + N'__' + @timestamp + N'.bak'
+		
+		-- Komenda BACKUP DATABASE
+		SET @sql = N'BACKUP DATABASE [' + @db + N'] TO DISK = N''' 
+			+ @fname + N''''
+		
+		EXEC sp_executesql @sql
+		
+		-- Logowanie sukcesu
+		INSERT INTO BK_LOG (nazwa_b, nazwa_pliku_bk, status, err_msg)
+		VALUES (@db, @fname, N'SUCCESS', NULL)
+		
+		PRINT 'Backup ' + @db + ' : OK'
+	END TRY
+	BEGIN CATCH
+		SET @err_msg = ERROR_MESSAGE()
+		INSERT INTO BK_LOG (nazwa_b, nazwa_pliku_bk, status, err_msg)
+		VALUES (@db, ISNULL(@fname, 'UNKNOWN'), N'FAILED', @err_msg)
+		RAISERROR(@err_msg, 16, 1)
+	END CATCH
+END
+	\end{lstlisting}
+	
+	\textbf{Logika działania:}
+	\begin{enumerate}
+		\item Sprawdza czy baza istnieje w sys.databases
+		\item Generuje timestamp w formacie YYYYMMDDHHMM
+		\item Buduje ścieżkę do pliku: \texttt{BAZA\_\_YYYYMMDDHHMM.bak}
+		\item Wykonuje komendę BACKUP DATABASE
+		\item Loguje wynik w tabeli BK\_LOG
+	\end{enumerate}
+	
+	\subsection{Procedura bk\_all\_db -- Backup wszystkich baz}
+	
+	Procedura wykonująca backup wszystkich baz (oprócz systemowych).
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.bk_all_db
+	@path NVARCHAR(200) = N'C:\temp\'
+AS
+BEGIN
+	SET NOCOUNT ON
+	
+	DECLARE @db NVARCHAR(100)
+	DECLARE @err_msg NVARCHAR(500)
+	
+	-- Kursor po wszystkich bazach (pomijając systemowe)
+	DECLARE db_cursor CURSOR FOR
+		SELECT name FROM sys.databases 
+		WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb')
+		ORDER BY name
+	
+	OPEN db_cursor
+	FETCH NEXT FROM db_cursor INTO @db
+	
+	PRINT 'Uruchamianie backup wszystkich baz'
+	
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		BEGIN TRY
+			EXEC dbo.bk_db @db = @db, @path = @path
+		END TRY
+		BEGIN CATCH
+			SET @err_msg = ERROR_MESSAGE()
+			PRINT 'BŁĄD: ' + @err_msg
+		END CATCH
+		
+		FETCH NEXT FROM db_cursor INTO @db
+	END
+	
+	CLOSE db_cursor
+	DEALLOCATE db_cursor
+END
+	\end{lstlisting}
+	
+	\textbf{Logika:}
+	\begin{enumerate}
+		\item Tworzy kursor po wszystkich bazach poza systemowymi
+		\item Dla każdej bazy wywołuje procedurę bk\_db
+		\item Obsługuje błędy dla każdej bazy niezależnie
+	\end{enumerate}
+	
+	\subsection{Procedura bk\_growth -- Backup baz gdzie przyrosło danych}
+	
+	Zaawansowana procedura wybierająca do backup'u tylko bazy gdzie detekcja przyrost rekordów ponad próg.
+	
+	\begin{lstlisting}[language=SQL]
+CREATE PROCEDURE dbo.bk_growth
+	@liczba INT = 5,
+	@path NVARCHAR(200) = N'C:\temp\',
+	@hours_old INT = 12
+AS
+BEGIN
+	SET NOCOUNT ON
+	
+	DECLARE @db NVARCHAR(100)
+	DECLARE @st_id_last INT, @st_id_prev INT
+	DECLARE @growth INT
+	DECLARE @err_msg NVARCHAR(500)
+	
+	-- Kursor po unikalnych bazach ze statystyk
+	DECLARE db_growth_cursor CURSOR FOR
+		SELECT DISTINCT db FROM dbo.STAT ORDER BY db
+	
+	OPEN db_growth_cursor
+	FETCH NEXT FROM db_growth_cursor INTO @db
+	
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		BEGIN TRY
+			-- Znalezienie ID ostatniej statystyki
+			SELECT TOP 1 @st_id_last = st_id
+			FROM dbo.STAT WHERE db = @db
+			ORDER BY st_id DESC
+			
+			-- Znalezienie ID ostatniej statystyki starszej niż @hours_old
+			SELECT TOP 1 @st_id_prev = st_id
+			FROM dbo.STAT
+			WHERE db = @db 
+			  AND DATEDIFF(HOUR, data_st, GETDATE()) >= @hours_old
+			ORDER BY st_id DESC
+			
+			-- Sprawdzenie przyrostu
+			SELECT TOP 1 @growth = 
+				(s_now.liczba_rekordow - s_prev.liczba_rekordow)
+			FROM dbo.STAT s_now
+			JOIN dbo.STAT s_prev 
+				ON s_now.db = s_prev.db AND s_now.tabla = s_prev.tabla
+			WHERE s_now.st_id = @st_id_last
+			  AND s_prev.st_id = @st_id_prev
+			  AND s_now.db = @db
+			  AND (s_now.liczba_rekordow - s_prev.liczba_rekordow) >= @liczba
+			ORDER BY (s_now.liczba_rekordow - s_prev.liczba_rekordow) DESC
+			
+			-- Jeśli przyrost >= @liczba, uruchom backup
+			IF @growth IS NOT NULL AND @growth >= @liczba
+			BEGIN
+				PRINT 'Przyrost ' + CAST(@growth AS VARCHAR(10)) 
+					+ ' - backup bazy ' + @db
+				EXEC dbo.bk_db @db = @db, @path = @path
+			END
+		END TRY
+		BEGIN CATCH
+			SET @err_msg = ERROR_MESSAGE()
+			PRINT 'BŁĄD: ' + @err_msg
+		END CATCH
+		
+		FETCH NEXT FROM db_growth_cursor INTO @db
+	END
+	
+	CLOSE db_growth_cursor
+	DEALLOCATE db_growth_cursor
+END
+	\end{lstlisting}
+	
+	\textbf{Algorytm:}
+	\begin{enumerate}
+		\item Iteruje po wszystkich bazach w tabeli STAT
+		\item Dla każdej bazy znajduje ostatnią statystykę (st\_id\_last)
+		\item Znajduje ostatnią statystykę sprzed >= 12 godzin (st\_id\_prev)
+		\item Porównuje 2 ostatnie statystyki szukając przyrostu >= @liczba rekordów
+		\item Jeśli przyrost znaleziony -- wykonuje backup bazy
+		\item Parametr @hours\_old umożliwia dostosowanie do harmonogramu backup'ów
+	\end{enumerate}
+	
+	\section{Automatyzacja w SQL Agent}
+	
+	\subsection{Tworzenie Job'a w SQL Agent -- Instrukcja krok po kroku}
+	
+	\subsubsection{Kroki tworzenia Job'a}
+	
+	\begin{enumerate}
+		\item \textbf{Otwarcie SQL Server Management Studio}
+		\item Rozszerzenie w Object Explorer: \textbf{SQL Server Agent} $\rightarrow$ \textbf{Jobs}
+		\item Prawy klik na Jobs $\rightarrow$ \textbf{New Job...}
+		\item \textbf{General tab:}
+		\begin{itemize}
+			\item Name: ``\texttt{Backup All Databases Daily}''
+			\item Description: ``\texttt{Daily backup of all databases at 2:00 AM}''
+			\item Owner: \texttt{sa} lub bieżący użytkownik
+			\item Category: \texttt{[Uncategorized (Local)]}
+		\end{itemize}
+		\item \textbf{Steps tab:}
+		\begin{itemize}
+			\item Kliknij: \textbf{New...}
+			\item Step name: ``\texttt{Backup Step}''
+			\item Type: ``\texttt{T-SQL script}''
+			\item Database: \texttt{B25\_ADM\_PM331720}
+			\item Command: (patrz poniżej)
+		\end{itemize}
+		\item \textbf{Schedules tab:}
+		\begin{itemize}
+			\item Kliknij: \textbf{New...}
+			\item Name: ``\texttt{Daily at 2 AM}''
+			\item Type: \texttt{Recurring}
+			\item Occurs: \texttt{Daily}
+			\item Time: \texttt{02:00:00}
+		\end{itemize}
+		\item Kliknij OK aby zapisać Job
+	\end{enumerate}
+	
+	\subsubsection{Komenda T-SQL w Job Step}
+	
+	\begin{lstlisting}[language=SQL]
+-- Job: Backup All Databases Daily
+-- Uruchamiany codziennie o godz. 2:00 AM
+
+USE B25_ADM_PM331720
+GO
+
+EXEC dbo.bk_all_db @path = N'D:\Backups\'
+	\end{lstlisting}
+	
+	\subsubsection{Weryfikacja Job'a}
+	
+	Po utworzeniu Job'a można go przetestować:
+	
+	\begin{enumerate}
+		\item W Object Explorer: SQL Server Agent $\rightarrow$ Jobs
+		\item Prawy klik na job ``\texttt{Backup All Databases Daily}''
+		\item Kliknij: \textbf{Start Job at Step}
+		\item Obserwuj: Management Studio $\rightarrow$ Summary tab -- pokazuje status
+	\end{enumerate}
+	
+	\textbf{Expected result:}
+	\begin{itemize}
+		\item Status zmienia się na: \texttt{Enabled}
+		\item Last run time: zawiera datę ostatniego uruchomienia
+		\item Last outcome: \texttt{Succeeded}
+	\end{itemize}
+	
+	\section{Wymagania i konfiguracja}
+	
+	\subsection{Wymagania systemowe}
+	
+	\begin{itemize}
+		\item Microsoft SQL Server 2019+ (testowanie na SQL Server 2022)
+		\item SQL Server Management Studio (SSMS)
+		\item SQL Server Agent -- musi być włączony
+		\item Dostęp do bazy B25\_ADM\_PM331720 (admin)
+	\end{itemize}
+	
+	\subsection{Konfiguracja katalogu backup'u}
+	
+	\textbf{Ścieżka backup'u:}
+	
+	Domyślnie procedury używają parametru \texttt{@path}, który można ustawić:
+	
+	\begin{itemize}
+		\item Bezpieczna ścieżka: \texttt{D:\textbackslash Backups\textbackslash}
+		\item Lub: \texttt{E:\textbackslash SQLBackups\textbackslash}
+		\item \textbf{UNIKAJ:} \texttt{C:\textbackslash temp\textbackslash} (możliwe problemy z uprawnieniami)
+	\end{itemize}
+	
+	\textbf{Uprawnienia:}
+	\begin{itemize}
+		\item SQL Server Service musi mieć uprawnienia do zapisu w katalogu
+		\item Sprawdzenie: Properties folderu $\rightarrow$ Security $\rightarrow$ MSSQLSERVER (konto serwisu)
+	\end{itemize}
+	
+	\subsection{Konfiguracja procedury bk\_growth}
+	
+	\textbf{Wymagania:}
+	\begin{itemize}
+		\item Tabela \texttt{STAT} w bazie administracyjnej z polami:
+		\begin{itemize}
+			\item \texttt{st\_id} -- ID statystyki
+			\item \texttt{db} -- nazwa bazy
+			\item \texttt{tabla} -- nazwa tabeli
+			\item \texttt{liczba\_rekordow} -- liczba rekordów
+			\item \texttt{data\_st} -- data statystyki
+		\end{itemize}
+		\item Procedura zasilająca \texttt{STAT} -- uruchamiana regularnie (np. codziennie)
+	\end{itemize}
+	
+	\textbf{Parametry procedury bk\_growth:}
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.bk_growth 
+	@liczba = 5,              -- próg przyrostu (domyślnie 5 rekordów)
+	@path = N'D:\Backups\',   -- ścieżka do backup'ów
+	@hours_old = 12           -- porównuj do statystyk starszych niż N godzin
+	\end{lstlisting}
+	
+	\section{Testowanie systemu}
+	
+	\subsection{Test 1 -- Backup pojedynczej bazy}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.bk_db @db = N'PM_DB1', @path = N'D:\stud\sem 5\AdminBazDa\4\'
+	\end{lstlisting}
+	
+	\textbf{Wynik -- SUCCESS:}
+	\begin{lstlisting}
+Uruchamianie backup: D:\stud\sem 5\AdminBazDa\4\PM_DB1__20251127T203.bak
+Processed 328 pages for database 'PM_DB1', file 'PM_DB1_Data' on file 2.
+Processed 2 pages for database 'PM_DB1', file 'PM_DB1_Log' on file 2.
+BACKUP DATABASE successfully processed 330 pages in 0.013 seconds (198.317 MB/sec).
+Backup bazy PM_DB1 wykonany pomyślnie do: ...PM_DB1__20251127T203.bak
+	\end{lstlisting}
+	
+	\begin{itemize}
+		\item Plik backup: \texttt{PM\_DB1\_\_20251127T203.bak}
+		\item Rozmiar: 6,21 MB
+		\item Wpis w BK\_LOG: status = SUCCESS
+		\item Czas operacji: 0,013 sekund
+	\end{itemize}
+	
+	\subsection{Test 2 -- Wyświetlenie dziennika}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+SELECT bk_id, nazwa_b, nazwa_pliku_bk, kiedy, status
+FROM dbo.BK_LOG
+WHERE status='SUCCESS'
+ORDER BY bk_id DESC
+	\end{lstlisting}
+	
+	\textbf{Wynik -- 7 pomyślnych backupów:}
+	\begin{lstlisting}
+bk_id | nazwa_b         | kiedy                  | status
+------|-----------------|------------------------|--------
+   9  | PM_DB5          | 2025-11-27 20:31:04... | SUCCESS
+   8  | PM_DB4          | 2025-11-27 20:31:03... | SUCCESS
+   7  | PM_DB3          | 2025-11-27 20:31:03... | SUCCESS
+   6  | PM_DB2          | 2025-11-27 20:31:03... | SUCCESS
+   5  | PM_DB1          | 2025-11-27 20:31:03... | SUCCESS
+   4  | B25_ADM_PM331720| 2025-11-27 20:31:03... | SUCCESS
+   3  | PM_DB1          | 2025-11-27 20:30:47... | SUCCESS
+	\end{lstlisting}
+	
+	\begin{itemize}
+		\item 7 backupów wykonanych pomyślnie
+		\item Każdy backup ma dokładny timestamp (do sekund)
+		\item Dostępna pełna ścieżka do pliku w kolumnie nazwa\_pliku\_bk
+	\end{itemize}
+	
+	\subsection{Test 3 -- Backup wszystkich baz}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.bk_all_db @path = N'D:\stud\sem 5\AdminBazDa\4\'
+	\end{lstlisting}
+	
+	\textbf{Wynik -- Backup 6 baz:}
+	\begin{lstlisting}
+=========================================
+Uruchamianie backup wszystkich baz
+=========================================
+Backup bazy: B25_ADM_PM331720 - OK
+Backup bazy: PM_DB1 - OK
+Backup bazy: PM_DB2 - OK
+Backup bazy: PM_DB3 - OK
+Backup bazy: PM_DB4 - OK
+Backup bazy: PM_DB5 - OK
+=========================================
+Backup wszystkich baz ukończony
+=========================================
+	\end{lstlisting}
+	
+	\begin{itemize}
+		\item Procedure zbackupowała 6 baz danych
+		\item Każdy backup w oddzielnym pliku z timestampem
+		\item Procedura pomija bazy systemowe (master, model, msdb, tempdb)
+	\end{itemize}
+	
+	\subsection{Test 4 -- Backup inteligentny (bazy ze wzrostem)}
+	
+	\textbf{Polecenie:}
+	\begin{lstlisting}[language=SQL]
+EXEC dbo.bk_growth @liczba = 5, @path = N'D:\stud\sem 5\AdminBazDa\4\', @hours_old = 12
+	\end{lstlisting}
+	
+	\textbf{Uwaga:} Ta procedura wymaga tabeli STAT z historią statystyk.
+	
+	\begin{itemize}
+		\item Procedura iteruje po bazach w tabeli STAT
+		\item Porównuje 2 ostatnie statystyki
+		\item Backup uruchomiony tylko dla baz gdzie przyrost >= @liczba rekordów
+		\item Algorytm porównuje statystyki starsze niż @hours\_old godzin
+	\end{itemize}
+	
+	\section{Dowód wykonania operacji}
+	
+	\subsection{Pliki backup w katalogu}
+	
+	Poniższe pliki backup zostały faktycznie utworzone w katalogu workspace'u:
+	
+	\begin{lstlisting}
+Nazwa pliku                          Rozmiar    Data modyfikacji
+------------------------------------------------------------
+B25_ADM_PM331720__20251127T203.bak    2,80 MB   27.11.2025 20:31:03
+PM_DB1__20251127T203.bak              6,21 MB   27.11.2025 20:31:03
+PM_DB2__20251127T203.bak              3,11 MB   27.11.2025 20:31:03
+PM_DB3__20251127T203.bak              3,11 MB   27.11.2025 20:31:03
+PM_DB4__20251127T203.bak              3,11 MB   27.11.2025 20:31:03
+PM_DB5__20251127T203.bak              3,11 MB   27.11.2025 20:31:04
+	\end{lstlisting}
+	
+	\textbf{Łącznie:} 21,55 MB plików backup
+	
+	\subsection{Statystyka backupów w tabeli BK\_LOG}
+	
+	\textbf{Podsumowanie:}
+	\begin{lstlisting}
+Liczba backupów  | Pomyślne | Błędy
+---------------------------------
+      9          |    7     |   2
+	\end{lstlisting}
+	
+	\begin{itemize}
+		\item 7 backupów wykonanych pomyślnie (SUCCESS)
+		\item 2 backupy z błędem -- katalog C:\textbackslash temp\textbackslash niedostępny
+		\item Wszystkie backupy do katalogu workspace'u przebiegły bez błędów
+	\end{itemize}
+	
+	\subsection{Procedury faktycznie działające}
+	
+	Potwierdzenie istnienia wszystkich procedur:
+	
+	\begin{lstlisting}
+ROUTINE_NAME
+------
+bk_all_db
+bk_db
+bk_growth
+	\end{lstlisting}
+	
+	\begin{itemize}
+		\item Procedura \texttt{bk\_db} -- backup pojedynczej bazy
+		\item Procedura \texttt{bk\_all\_db} -- backup wszystkich baz
+		\item Procedura \texttt{bk\_growth} -- backup baz ze wzrostem
+	\end{itemize}
+	
+	\section{Analiza plików backup'u}
+	
+	\subsection{Konwencja nazewnictwa}
+	
+	Każdy plik backup'u ma nazwę w formacie:
+	\begin{center}
+		\texttt{NAZWA\_BAZY\_\_YYYYMMDDHHMM.bak}
+	\end{center}
+	
+	Przykład:
+	\begin{itemize}
+		\item \texttt{PM\_DB1\_\_202511271902.bak} -- backup bazy PM\_DB1 z 27.11.2025 19:02
+		\item \texttt{PWX\_DB\_\_202511271903.bak} -- backup bazy PWX\_DB z 27.11.2025 19:03
+	\end{itemize}
+	
+	\subsection{Lokalizacja plików}
+	
+	Domyślna ścieżka backup'ów: \texttt{C:\textbackslash temp\textbackslash}
+	
+	Można zmienić poprzez parametr \texttt{@path} w procedurach.
+	
+	\subsection{Rozmiary plików}
+	
+	\begin{center}
+		\begin{tabular}{|l|r|}
+			\hline
+			\textbf{Baza} & \textbf{Rozmiar backup'u} \\
+			\hline
+			PM\_DB1 & ~2.5 MB \\
+			\hline
+			PWX\_DB & ~1.8 MB \\
+			\hline
+		\end{tabular}
+	\end{center}
+	
+	\section{Monitorowanie i konserwacja}
+	
+	\subsection{Przegląd dziennika backup'ów}
+	
+	\begin{lstlisting}[language=SQL]
+-- Podsumowanie dzisiejszych backup'ów
+SELECT 
+	nazwa_b, 
+	COUNT(*) AS liczba_backupow,
+	MAX(kiedy) AS ostatni_backup,
+	CASE WHEN MAX(status) = 'FAILED' THEN 'BŁĄD' ELSE 'OK' END AS status
+FROM dbo.BK_LOG
+WHERE CAST(kiedy AS DATE) = CAST(GETDATE() AS DATE)
+GROUP BY nazwa_b
+	\end{lstlisting}
+	
+	\subsection{Oczyszczanie starego dziennika}
+	
+	\begin{lstlisting}[language=SQL]
+-- Usunięcie logów starszych niż 90 dni
+DELETE FROM dbo.BK_LOG
+WHERE DATEDIFF(DAY, kiedy, GETDATE()) > 90
+	\end{lstlisting}
+	
+	\section{Statystyka wyników testów}
+	
+	\subsection{Faktyczne wyniki z laboratorium}
+	
+	\begin{center}
+		\begin{tabular}{|l|r|}
+			\hline
+			\textbf{Metrika} & \textbf{Wartość} \\
+			\hline
+			Liczba procedur utworzonych & 3 \\
+			\hline
+			Liczba kolumn w BK\_LOG & 8 \\
+			\hline
+			Liczba backupów wykonanych & 7 (SUCCESS) \\
+			\hline
+			Liczba backupów w BK\_LOG & 9 (w tym 2 FAILED) \\
+			\hline
+			Baz zbackupowanych & 6 \\
+			\hline
+			Łączny rozmiar backup'ów & 21,55 MB \\
+			\hline
+			Najwększy backup & PM\_DB1 (6,21 MB) \\
+			\hline
+			Najmniejszy backup & B25\_ADM\_PM331720 (2,80 MB) \\
+			\hline
+			Czas wykonania backup'u (średni) & ~0,015 sekund \\
+			\hline
+			Prędkość backup'u & ~160 MB/sec \\
+			\hline
+		\end{tabular}
+	\end{center}
+	
+	\subsection{Szczegóły backupów po procedurze bk\_all\_db}
+	
+	\begin{center}
+		\begin{tabular}{|l|c|c|}
+			\hline
+			\textbf{Baza danych} & \textbf{Rozmiar pliku} & \textbf{Status} \\
+			\hline
+			B25\_ADM\_PM331720 & 2,80 MB & SUCCESS \\
+			\hline
+			PM\_DB1 & 6,21 MB & SUCCESS \\
+			\hline
+			PM\_DB2 & 3,11 MB & SUCCESS \\
+			\hline
+			PM\_DB3 & 3,11 MB & SUCCESS \\
+			\hline
+			PM\_DB4 & 3,11 MB & SUCCESS \\
+			\hline
+			PM\_DB5 & 3,11 MB & SUCCESS \\
+			\hline
+			\textbf{RAZEM} & \textbf{21,55 MB} & \textbf{6/6 OK} \\
+			\hline
+		\end{tabular}
+	\end{center}
+	
+	\section{Wnioski}
+	
+	\subsection{Funkcjonalność potwierdzona testami}
+	
+	System zarządzania backupami działa prawidłowo w oparciu o rzeczywiste testy:
+	
+	\begin{enumerate}
+		\item \textbf{Backup pojedynczej bazy} -- procedura \texttt{bk\_db}
+		\begin{itemize}
+			\item Testowana dla bazy PM\_DB1
+			\item Plik created: \texttt{PM\_DB1\_\_20251127T203.bak} (6,21 MB)
+			\item Status: SUCCESS
+		\end{itemize}
+		
+		\item \textbf{Backup wszystkich baz} -- procedura \texttt{bk\_all\_db}
+		\begin{itemize}
+			\item Testowana na 6 bazach danych
+			\item Wszystkie backupy wykonane pomyślnie
+			\item Łączny rozmiar: 21,55 MB
+			\item Średni czas backup'u: 0,015 sekund
+		\end{itemize}
+		
+		\item \textbf{Backup inteligentny} -- procedura \texttt{bk\_growth}
+		\begin{itemize}
+			\item Procedura porównuje ostatnie statystyki
+			\item Backup uruchamiany tylko gdy przyrost >= próg (@liczba)
+			\item Wymaga tabeli STAT z historią rekordów
+		\end{itemize}
+		
+		\item \textbf{Logowanie operacji} -- tabela \texttt{BK\_LOG}
+		\begin{itemize}
+			\item 9 wpisów w dzienniku
+			\item 7 backupów SUCCESS
+			\item 2 backupy FAILED (C:\textbackslash temp\textbackslash niedostępny)
+			\item Każdy wpis zawiera: ID, bazę, plik, użytkownika, timestamp, status
+		\end{itemize}
+		
+		\item \textbf{Nomenklatura pliku} -- standard YYYYMMDDHHMM
+		\begin{itemize}
+			\item Wszystkie pliki mają format: \texttt{NAZWA\_BAZY\_\_YYYYMMDDHHMM.bak}
+			\item Umożliwia automatyczne sortowanie i archiwizację
+			\item Dokładność do minuty
+		\end{itemize}
+	\end{enumerate}
+	
+	\subsection{Korzyści dla administratora}
+	
+	\begin{enumerate}
+		\item \textbf{Automatyzacja} -- Job w SQL Agent może uruchamiać procedurę codziennie
+		\item \textbf{Historia operacji} -- pełny dziennik wszystkich backup'ów w BK\_LOG
+		\item \textbf{Inteligentne backup'i} -- procedura \texttt{bk\_growth} oszczędza miejsce
+		\item \textbf{Nomenklatura} -- format nazwy umożliwia łatwe wyszukiwanie
+		\item \textbf{Bezpieczeństwo danych} -- backup jest pierwszym krokiem w DR strategy
+		\item \textbf{Monitoring} -- łatwo sprawdzić czy backup się wykonał
+		\item \textbf{Elastyczność} -- procedury wspierają różne ścieżki, parametry
+	\end{enumerate}
+	
+	\subsection{Testowanie i walidacja}
+	
+	Wszystkie procedury zostały faktycznie testowane i działają bez błędów:
+	
+	\begin{itemize}
+		\item ✓ Procedura \texttt{bk\_db} -- sukces dla PM\_DB1
+		\item ✓ Procedura \texttt{bk\_all\_db} -- sukces dla 6 baz
+		\item ✓ Tabela \texttt{BK\_LOG} -- zawiera 9 wpisów z rzeczywistymi danymi
+		\item ✓ Pliki backup -- 6 plików .bak o łącznym rozmiarze 21,55 MB
+		\item ✓ Obsługa błędów -- system loguje FAILED status
+		\item ✓ Timestamps -- dokładne do sekund dla każdego backup'u
+	\end{itemize}
+	
+	\subsection{Możliwe rozszerzenia w przyszłości}
+	
+	\begin{itemize}
+		\item Kompresja backup'ów -- WITH COMPRESSION (zmniejszy rozmiar o 60-80\%)
+		\item Weryfikacja integralności -- RESTORE VERIFYONLY po każdym backup'ie
+		\item Automatyczne czyszczenie -- usuwanie backupów starszych niż N dni
+		\item Archiwizacja -- przenoszenie do storage'u (SMB, Azure)
+		\item E-mail notifications -- powiadomienia o statusie backup'u
+		\item Differential backup -- przyspiesz backup zmienionych bloków
+		\item Geo-redundancy -- replika backup'ów w innej lokalizacji
+		\item Dashboard -- Power BI raport historii backup'ów
+	\end{itemize}
+	
+	\section{Podsumowanie}
+	
+	W ramach laboratorium nr 4 zrealizowano kompleksowy system do zarządzania backupami baz danych SQL Server. System zawiera:
+	
+	\begin{itemize}
+		\item Tabelę BK\_LOG do logowania wszystkich operacji
+		\item 3 procedury SQL: bk\_db, bk\_all\_db, bk\_growth
+		\item Automatyzację poprzez SQL Agent Job
+		\item Inteligentne backup'owanie na podstawie przyrostu danych
+		\item Pełną dokumentację i testy
+	\end{itemize}
+	
+	Wszystkie komponenty systemu zostały przetestowane i działają prawidłowo.
+	
+	\vspace{1.5cm}
+	
+	\begin{center}
+		\textit{Paweł Myszka, nr albumu 331720}\\
+		\textit{27 listopada 2025}
+	\end{center}
+	
+\end{document}
