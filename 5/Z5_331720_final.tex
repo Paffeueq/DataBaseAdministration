@@ -1,0 +1,224 @@
+\documentclass[a4paper,11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[polish]{babel}
+\usepackage{graphicx}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage[margin=2cm]{geometry}
+
+\lstset{
+	basicstyle=\ttfamily\small,
+	breaklines=true,
+	frame=single,
+	backgroundcolor=\color{gray!10},
+	numbers=left,
+	numberstyle=\tiny,
+	keywordstyle=\color{blue}\bfseries,
+	commentstyle=\color{green!60!black},
+	stringstyle=\color{red}
+}
+
+\title{Laboratorium nr 5\\
+	\large Usuwanie kolumny z ograniczeniami}
+\author{Paweł Myszka, nr albumu 331720}
+\date{13 grudnia 2025}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{Z5 -- 331720}
+\fancyhead[R]{Administracja BD}
+\fancyfoot[C]{\thepage}
+
+\begin{document}
+	
+	\maketitle
+	
+	\section{Zadanie}
+	
+	Napisać procedurę \texttt{usun\_kol}, która automatycznie usunie kolumnę z tabeli wraz ze \textbf{wszystkimi} jej ograniczeniami (CONSTRAINTS). Procedura powinna:
+	\begin{itemize}
+		\item Przyjmować parametry: nazwa\_bazy, nazwa\_tabeli, nazwa\_kolumny
+		\item Znaleźć wszystkie constraints związane z daną kolumną (DEFAULT, FOREIGN KEY, PRIMARY KEY, itp.)
+		\item Usunąć constraints w pętli/kursorze
+		\item Usunąć kolumnę
+		\item Wyświetlić dowód działania (SELECT przed i po usunięciu)
+	\end{itemize}
+
+	\section{Problem}
+	
+	Nie zawsze jest możliwe bezpośrednie usunięcie kolumny, szczególnie gdy kolumna posiada przypisane ograniczenia. Próba wykonania:
+	
+	\begin{lstlisting}[language=SQL]
+ALTER TABLE DETAIL_TB DROP COLUMN MASTER_ID
+	\end{lstlisting}
+	
+	powoduje błąd:
+	\begin{lstlisting}
+Msg 5074: The object 'DF__DETAIL_TB__maste__3E52440B' is dependent on column 'MASTER_ID'.
+Msg 5074: The object 'FK_DETAIL__MASTER_TB' is dependent on column 'MASTER_ID'.
+Msg 4922: ALTER TABLE DROP COLUMN MASTER_ID failed because one or more objects access this column.
+	\end{lstlisting}
+	
+	\section{Implementacja}
+	
+	\subsection{Procedura usun\_kol}
+	
+	\begin{lstlisting}
+CREATE PROCEDURE usun_kol
+	@nazwa_bazy NVARCHAR(128),
+	@nazwa_tabeli NVARCHAR(128),
+	@nazwa_kolumny NVARCHAR(128)
+AS
+BEGIN
+	DECLARE @sql NVARCHAR(MAX)
+	DECLARE @constraint_name NVARCHAR(128)
+	
+	-- Sprawdzenie czy kolumna istnieje
+	IF NOT EXISTS (
+		SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_CATALOG = @nazwa_bazy
+		AND TABLE_NAME = @nazwa_tabeli
+		AND COLUMN_NAME = @nazwa_kolumny
+	)
+	BEGIN
+		RAISERROR('Kolumna %s nie istnieje w tabeli %s.%s', 
+			16, 1, @nazwa_kolumny, @nazwa_bazy, @nazwa_tabeli)
+		RETURN
+	END
+	
+	-- Kursor do usunięcia wszystkich constraints związanych z kolumną
+	DECLARE constraint_cursor CURSOR FOR
+		SELECT CONSTRAINT_NAME
+		FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE
+		WHERE TABLE_CATALOG = @nazwa_bazy
+		AND TABLE_NAME = @nazwa_tabeli
+		AND COLUMN_NAME = @nazwa_kolumny
+		UNION
+		SELECT d.name
+		FROM sys.default_constraints d
+		JOIN sys.columns c ON d.parent_object_id = OBJECT_ID(@nazwa_tabeli)
+		AND d.parent_column_id = c.column_id
+		WHERE c.name = @nazwa_kolumny
+	
+	OPEN constraint_cursor
+	FETCH NEXT FROM constraint_cursor INTO @constraint_name
+	
+	WHILE @@FETCH_STATUS = 0
+	BEGIN
+		SET @sql = N'ALTER TABLE [' + @nazwa_bazy + '].dbo.[' 
+			+ @nazwa_tabeli + '] DROP CONSTRAINT [' 
+			+ @constraint_name + ']'
+		EXEC sp_executesql @sql
+		PRINT 'Usunięto constraint: ' + @constraint_name
+		
+		FETCH NEXT FROM constraint_cursor INTO @constraint_name
+	END
+	
+	CLOSE constraint_cursor
+	DEALLOCATE constraint_cursor
+	
+	-- Usunięcie kolumny
+	SET @sql = N'ALTER TABLE [' + @nazwa_bazy + '].dbo.[' 
+		+ @nazwa_tabeli + '] DROP COLUMN [' + @nazwa_kolumny + ']'
+	EXEC sp_executesql @sql
+	PRINT 'Usunięto kolumnę: ' + @nazwa_kolumny
+	
+END
+	\end{lstlisting}
+	
+	\section{Wyjaśnienie Implementacji}
+	
+	\subsection{Sprawdzenie kolumny}
+	
+	Procedura najpierw weryfikuje, czy dana kolumna istnieje w tabeli, korzystając z widoku \texttt{INFORMATION\_SCHEMA.COLUMNS}. Jeśli kolumna nie istnieje, procedura zwraca błąd za pomocą \texttt{RAISERROR}.
+	
+	\subsection{Znajdowanie Constraints}
+	
+	Aby znaleźć wszystkie constraints powiązane z kolumną, procedura korzysta z dwóch źródeł:
+	
+	\begin{itemize}
+		\item \texttt{INFORMATION\_SCHEMA.CONSTRAINT\_COLUMN\_USAGE} -- zawiera FOREIGN KEY, PRIMARY KEY, UNIQUE constraints
+		\item \texttt{sys.default\_constraints} -- zawiera DEFAULT constraints
+	\end{itemize}
+	
+	Obie tabele są połączone za pomocą \texttt{UNION}, aby uzyskać kompletną listę.
+	
+	\subsection{Usuwanie Constraints}
+	
+	Kursor iteruje po wszystkich znalezionych constraints i usuwa je jeden po drugim przy użyciu:
+	
+	\begin{lstlisting}[language=SQL]
+ALTER TABLE [nazwa_bazy].dbo.[nazwa_tabeli] DROP CONSTRAINT [nazwa_constraint]
+	\end{lstlisting}
+	
+	Dla każdego usuniętego constraintu wyświetlony jest komunikat \texttt{PRINT}.
+	
+	\subsection{Usuwanie Kolumny}
+	
+	Po usunięciu wszystkich constraints, procedura usuwa samą kolumnę:
+	
+	\begin{lstlisting}[language=SQL]
+ALTER TABLE [nazwa_bazy].dbo.[nazwa_tabeli] DROP COLUMN [nazwa_kolumny]
+	\end{lstlisting}
+	
+	\section{Testowanie}
+	
+	\subsection{Przygotowanie}
+	
+	Procedura została przetestowana na dwóch tabelach:
+	\begin{itemize}
+		\item \texttt{MASTER\_TB} -- zawiera klucz główny
+		\item \texttt{DETAIL\_TB} -- zawiera kolumnę \texttt{MASTER\_ID} z dwoma constraints:
+		\begin{itemize}
+			\item DEFAULT constraint (wartość domyślna: M01)
+			\item FOREIGN KEY constraint (odniesienie do MASTER\_TB)
+		\end{itemize}
+	\end{itemize}
+	
+	\subsection{Wynik Testowania}
+	
+	Procedura \texttt{usun\_kol} została pomyślnie uruchomiona:
+	
+	\begin{lstlisting}
+EXEC usun_kol 
+	@nazwa_bazy = 'B25_ADM_PM331720', 
+	@nazwa_tabeli = 'DETAIL_TB', 
+	@nazwa_kolumny = 'MASTER_ID'
+	\end{lstlisting}
+	
+	Wynik:
+	\begin{lstlisting}
+Usunięto constraint: DF__DETAIL_TB__maste__3D2915A8
+Usunięto constraint: FK_DETAIL__MASTER_TB
+Usunięto kolumnę: MASTER_ID
+	\end{lstlisting}
+	
+	Przed usunięciem kolumna \texttt{MASTER\_ID} zawierała wartość:
+	\begin{lstlisting}
+master_id            DETAIL_ID
+-------------------- --------------------
+M01                  D01
+	\end{lstlisting}
+	
+	Po usunięciu kolumny tabela zawiera tylko:
+	\begin{lstlisting}
+DETAIL_ID
+--------------------
+D01
+	\end{lstlisting}
+	
+	\section{Wnioski}
+	
+	\begin{itemize}
+		\item ✓ Procedura \texttt{usun\_kol} prawidłowo identyfikuje wszystkie constraints powiązane z kolumną
+		\item ✓ Constraints (zarówno DEFAULT jak i FOREIGN KEY) są poprawnie usuwane
+		\item ✓ Kolumna jest usuwana dopiero po usunięciu wszystkich constraints
+		\item ✓ Procedura wyświetla komunikaty potwierdzające każdy krok operacji
+		\item ✓ Procedura zabezpiecza się przed usunięciem nieistniejącej kolumny
+		\item ✓ Rozwiązanie umożliwia automatyzację procesu usuwania kolumn z ograniczeniami
+	\end{itemize}
+	
+\end{document}
